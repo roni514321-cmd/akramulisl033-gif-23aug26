@@ -1,8 +1,4 @@
-pyTelegramBotAPI
-flask
-firebase-admin
-openpyxl
-pytz
 requests
-pymysql
-cryptography
+firebase-admin
+pyotp
+beautifulsoup4
