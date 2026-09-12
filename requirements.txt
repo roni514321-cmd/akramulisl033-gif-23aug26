@@ -1,4 +1,5 @@
-requests
-firebase-admin
-pyotp
-beautifulsoup4
+aiogram>=3.7,<4
+SQLAlchemy>=2.0,<3
+aiosqlite>=0.19
+openpyxl>=3.1
+python-dotenv>=1.0
