@@ -1,4 +1,6 @@
-pyTelegramBotAPI==4.23.0
-Flask==3.0.3
-gunicorn==22.0.0
-openpyxl
+aiogram==3.13.1
+aiohttp==3.10.10
+SQLAlchemy==2.0.35
+aiosqlite==0.20.0
+openpyxl==3.1.5
+python-dotenv==1.0.1
