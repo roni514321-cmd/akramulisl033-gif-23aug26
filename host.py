@@ -1,0 +1,2483 @@
+# -*- coding: utf-8 -*-
+"""
+Virtual Number Shop - Telegram Bot
+====================================================================
+বাটন, মেনু নেভিগেশন ও স্ট্যাকচারের পাশাপাশি এখন Purchase (Buy one pcs / Bulk Buy)
+এবং Admin File Upload (stock যুক্ত করা) এর real logic যুক্ত করা হয়েছে।
+⚠️ ডেটা এখনও in-memory (RAM) তে থাকে -> bot restart হলে সব হারিয়ে যাবে।
+যেখানে আসল Payment gateway / persistent Database বসবে সেখানে এখনও
+# TODO: ... কমেন্ট দিয়ে চিহ্নিত করা আছে।
+
+Library: pyTelegramBotAPI (telebot)
+    pip install pyTelegramBotAPI flask openpyxl
+
+Environment variables (Railway এ / .env এ সেট করবেন):
+    BOT_TOKEN     -> BotFather থেকে পাওয়া টোকেন
+    ADMIN_ID      -> আপনার টেলিগ্রাম User ID (একাধিক হলে কমা দিয়ে আলাদা করুন)
+    RAILWAY_URL   -> Railway তে ডিপ্লয় করা অ্যাপের পাবলিক URL (webhook এর জন্য)
+    PORT          -> Railway যে পোর্ট দেয় (ডিফল্ট 8080)
+
+Run mode:
+    - RAILWAY_URL সেট থাকলে -> Webhook mode (Flask + Railway)
+    - RAILWAY_URL না থাকলে -> Polling mode (লোকাল টেস্টিং এর জন্য)
+"""
+
+import os
+import io
+import json
+import re
+import threading
+import uuid
+import datetime
+
+import telebot
+from telebot import types
+
+# ---------------------------------------------------------------------------
+# ENV / CONFIG
+# ---------------------------------------------------------------------------
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")
+ADMIN_IDS = [
+    int(x.strip())
+    for x in os.environ.get("ADMIN_ID", "6053411200").split(",")
+    if x.strip().isdigit()
+]
+RAILWAY_URL = os.environ.get("RAILWAY_URL", "")   # e.g. https://your-app.up.railway.app
+PORT = int(os.environ.get("PORT", 8080))
+REFERRAL_BONUS = 10   # TODO: real bonus amount (এডমিন Bot Settings থেকে সেট করার আগে placeholder)
+
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+
+# বটের আসল username নিজে থেকে (dynamically) নিয়ে নেওয়া হচ্ছে, যাতে রেফারেল লিংকে
+# ভুল/হার্ডকোড করা username (যেমন "vertual_shop_bot" / "virtualshop") না বসে।
+try:
+    BOT_USERNAME = bot.get_me().username
+except Exception:
+    BOT_USERNAME = os.environ.get("BOT_USERNAME", "your_bot_username")  # fallback
+
+# ---------------------------------------------------------------------------
+# TEMP IN-MEMORY "DATABASE" (placeholder only)
+# TODO: এইগুলোকে আসল Database (SQLite/PostgreSQL/MongoDB) দিয়ে replace করবেন
+# ---------------------------------------------------------------------------
+users = {}      # user_id -> {full_name, username, balance, total_purchased, today_spent, today_deposit, referrals, earned}
+products = {
+    "whatsapp": {
+        "name": "WhatsApp Number",
+        "price": 0,          # TODO: real price (এডমিন সেট করার আগে purchase ব্লক থাকবে)
+        "stock": 0,          # Upload File থেকে auto আপডেট হয়
+        "description": "WhatsApp verification number.",  # TODO
+        "stock_list": [],    # [{"number": "...", "otp_link": "..."}, ...]
+    },
+    "telegram": {
+        "name": "Telegram Number",
+        "price": 0,          # TODO: real price (এডমিন সেট করার আগে purchase ব্লক থাকবে)
+        "stock": 0,          # Upload File থেকে auto আপডেট হয়
+        "description": "Telegram verification number.",  # TODO
+        "stock_list": [],    # [{"number": "...", "otp_link": "..."}, ...]
+    },
+}
+orders = {}     # order_id -> order data
+deposits = {}   # deposit_id -> {id, user_id, method, amount, trx_id, status, date}
+_deposit_id_counter = [1000]   # পরবর্তী deposit id বানানোর কাউন্টার (in-memory)
+sms_log = []    # SMS Forwarder থেকে আসা প্রতিটা পার্স-করা পেমেন্ট SMS/নোটিফিকেশন
+_sms_id_counter = [0]          # পরবর্তী sms log id বানানোর কাউন্টার (in-memory)
+
+
+def _next_deposit_id():
+    _deposit_id_counter[0] += 1
+    return _deposit_id_counter[0]
+
+
+def _next_sms_id():
+    _sms_id_counter[0] += 1
+    return _sms_id_counter[0]
+
+
+# এই মেথডগুলোর ডিপোজিট সবসময় ম্যানুয়ালি Admin রিভিউ করে Approve/Reject করা হবে
+# (bKash/Nagad/Rocket/Binance -> TrxID যাচাই করে Admin নিজে Approve করবে)।
+# bot_settings["deposit_methods"] এ এর বাইরে যেকোনো মেথড থাকলে সেটা সাথে সাথে
+# (কোনো Admin রিভিউ ছাড়াই) অটো-অ্যাপ্রুভ হয়ে যাবে।
+DEPOSIT_MANUAL_METHODS = ["bKash", "Nagad", "Rocket", "Binance"]
+
+# ---------------------------------------------------------------------------
+# BOT SETTINGS (runtime-editable, Admin Panel -> ⚙️ Bot Settings থেকে বদলানো যায়)
+# TODO: এইগুলোও persistent Database তে সংরক্ষণ করবেন (এখনো in-memory)
+# ---------------------------------------------------------------------------
+bot_settings = {
+    "referral_bonus": REFERRAL_BONUS,   # প্রতি রেফারেলে বোনাস (BDT)
+    "min_deposit": 0,                   # 0 মানে কোনো সীমা সেট করা নেই
+    "max_deposit": 0,                   # 0 মানে কোনো সীমা সেট করা নেই
+    "maintenance_mode": False,          # True হলে সাধারণ ইউজাররা বট ব্যবহার করতে পারবে না
+    "deposit_methods": ["bKash", "Nagad", "Rocket", "Binance"],  # কমা-আলাদা তালিকা, Admin থেকে এডিট হয়
+    "deposit_numbers": {                # প্রতিটা মেথডের পেমেন্ট নাম্বার/অ্যাড্রেস (Admin প্যানেল থেকে সেট হবে)
+        "bKash": "",
+        "Nagad": "",
+        "Rocket": "",
+        "Binance": "",
+    },
+    "usd_rate": 0,                       # 1 USD = কত BDT (Admin Panel থেকে সেট হবে; 0 মানে সেট করা নেই)
+}
+
+# navigation state per user, e.g. {"menu": "buy_number", "product": "whatsapp"}
+user_state = {}
+
+
+def get_user(message_or_call):
+    """Ensure user exists in temp store and return the user dict."""
+    u = message_or_call.from_user
+    uid = u.id
+    if uid not in users:
+        users[uid] = {
+            "full_name": (u.first_name or "") + ((" " + u.last_name) if u.last_name else ""),
+            "username": f"@{u.username}" if u.username else "N/A",
+            "balance": 0,
+            "total_purchased": 0,
+            "today_spent": 0,
+            "today_deposit": 0,
+            "referrals": 0,
+            "earned": 0,
+            "referred_by": None,   # কে রেফার করেছে (user_id), একবারই সেট হবে
+        }
+    return users[uid]
+
+
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
+
+
+def maintenance_block(ctx):
+    """Maintenance mode চালু থাকলে non-admin ইউজারদের ব্লক করে True রিটার্ন করে।
+    ctx একটি message অথবা callback হতে পারে।"""
+    uid = ctx.from_user.id
+    if bot_settings["maintenance_mode"] and not is_admin(uid):
+        chat_id = ctx.chat.id if hasattr(ctx, "chat") else ctx.message.chat.id
+        bot.send_message(
+            chat_id,
+            "🛠️ <b>Bot is under maintenance</b>\n\n"
+            "দুঃখিত, বটটি বর্তমানে মেইনটেন্যান্সে আছে। একটু পরে আবার চেষ্টা করুন।",
+        )
+        return True
+    return False
+
+
+def fmt_amount(value):
+    """সব জায়গায় একই ফরম্যাটে টাকা দেখানোর জন্য: 100৳ ($0.91)
+    bot_settings["usd_rate"] (1 USD = কত BDT) অনুযায়ী ডলার হিসাব করা হয়;
+    রেট সেট করা না থাকলে (0) BDT ভ্যালুটাই ডলার হিসেবে দেখানো হয়।"""
+    rate = bot_settings.get("usd_rate") or 0
+    usd = (value / rate) if rate > 0 else value
+    return f"{value}৳ (${usd:.2f})"
+
+
+# ---------------------------------------------------------------------------
+# KEYBOARDS (Reply / Main menu)
+# ---------------------------------------------------------------------------
+def main_menu_keyboard(user_id):
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    kb.add(
+        types.KeyboardButton("🛒 Buy Number"),
+        types.KeyboardButton("👤 Profile"),
+    )
+    kb.add(
+        types.KeyboardButton("💳 Deposit"),
+        types.KeyboardButton("🎁 Referral"),
+    )
+    kb.add(
+        types.KeyboardButton("🆘 Support"),
+        types.KeyboardButton("⚙️ Method"),
+    )
+    if is_admin(user_id):
+        kb.add(types.KeyboardButton("👮 Admin Panel"))
+    return kb
+
+
+def back_to_main_keyboard():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(types.KeyboardButton("⬅️ Back to Menu"))
+    return kb
+
+
+def back_only_keyboard():
+    """শুধু Back বাটনসহ কীবোর্ড — Bulk Buy quantity ইনপুট ধাপে ব্যবহার হয়,
+    এখান থেকে Back করলে buy মেনুতে (main menu তে নয়) ফিরে যায়।"""
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(types.KeyboardButton("⬅️ Back"))
+    return kb
+
+
+# ---------------------------------------------------------------------------
+# KEYBOARDS (Inline)
+# ---------------------------------------------------------------------------
+def buy_number_type_inline():
+    """দুইটা ইনলাইন বাটন একটার নিচে আরেকটা (vertically stacked) থাকবে।"""
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton("📱 WhatsApp Number", callback_data="prod_whatsapp"))
+    kb.add(types.InlineKeyboardButton("✈️ Telegram Number", callback_data="prod_telegram"))
+    return kb
+
+
+def product_detail_keyboard():
+    """3 keyboard buttons shown after selecting product, stacked vertically:
+    Buy one pcs / Bulk Buy / Back"""
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
+    kb.add(types.KeyboardButton("🛍️ Buy one pcs"))
+    kb.add(types.KeyboardButton("📦 Bulk Buy"))
+    kb.add(types.KeyboardButton("⬅️ Back"))
+    return kb
+
+
+def referral_inline():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("🔗 Share your link and earn!", switch_inline_query="join_now"))
+    return kb
+
+
+def upload_file_product_inline():
+    """Admin ফাইল আপলোডের আগে কোন প্রোডাক্টের স্টক আপডেট হবে সেটা বেছে নেয়।"""
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("📱 WhatsApp Number", callback_data="uploadprod_whatsapp"),
+        types.InlineKeyboardButton("✈️ Telegram Number", callback_data="uploadprod_telegram"),
+    )
+    return kb
+
+
+def upload_confirm_inline():
+    """Stock ফাইল parse হওয়ার পর আসলে stock এ যুক্ত করার আগে কনফার্মেশন।"""
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("✅ Confirm & Add", callback_data="stockup_confirm"),
+        types.InlineKeyboardButton("❌ Cancel", callback_data="stockup_cancel"),
+    )
+    return kb
+
+
+def stock_broadcast_confirm_inline():
+    """নতুন Stock Add হওয়ার পর সেই আপডেটটা সব ইউজারকে broadcast করবে কিনা জিজ্ঞেস করে।"""
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("✅ হ্যাঁ, Broadcast করুন", callback_data="stockbroadcast_yes"),
+        types.InlineKeyboardButton("❌ না", callback_data="stockbroadcast_no"),
+    )
+    return kb
+
+
+def deposit_methods_inline():
+    """ইউজারকে Deposit মেথড বেছে নেওয়ার বাটন দেখায় (bot_settings['deposit_methods'] থেকে)।"""
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for m in bot_settings["deposit_methods"]:
+        kb.add(types.InlineKeyboardButton(f"💳 {m}", callback_data=f"depmethod_{m}"))
+    kb.add(types.InlineKeyboardButton("⬅️ Back", callback_data="dep_back"))
+    return kb
+
+
+def deposit_cancel_inline():
+    """Deposit amount ইনপুট ধাপে Back এর বদলে দেখানো Cancel বাটন।"""
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("❌ Cancel", callback_data="deposit_cancel"))
+    return kb
+
+
+def deposit_review_inline(dep_id):
+    """Admin কে পাঠানো pending deposit নোটিফিকেশনে Approve/Reject বাটন।"""
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("✅ Approve", callback_data=f"depapprove_{dep_id}"),
+        types.InlineKeyboardButton("❌ Reject", callback_data=f"depreject_{dep_id}"),
+    )
+    return kb
+
+
+def deposit_numbers_inline():
+    """Admin প্যানেলে ম্যানুয়াল মেথডগুলোর পেমেন্ট নাম্বার/অ্যাড্রেস সেট করার বাটন।"""
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for m in DEPOSIT_MANUAL_METHODS:
+        num = bot_settings["deposit_numbers"].get(m) or "❌ সেট করা নেই"
+        kb.add(types.InlineKeyboardButton(f"{m}: {num}", callback_data=f"depnum_{m}"))
+    kb.add(types.InlineKeyboardButton("⬅️ Back", callback_data="settings_back"))
+    return kb
+
+
+def set_price_product_inline():
+    """Admin price পরিবর্তনের আগে কোন প্রোডাক্টের price বদলাবে সেটা বেছে নেয়।"""
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("📱 WhatsApp Number", callback_data="priceprod_whatsapp"),
+        types.InlineKeyboardButton("✈️ Telegram Number", callback_data="priceprod_telegram"),
+    )
+    return kb
+
+
+def admin_panel_inline():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("📤 Upload File", callback_data="admin_upload_file"),
+        types.InlineKeyboardButton("💰 Set Price", callback_data="admin_set_price_stock"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("💱 Set Dollar Rate", callback_data="admin_set_usd_rate"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("👥 Users List", callback_data="admin_users_list"),
+        types.InlineKeyboardButton("📊 Statistics", callback_data="admin_statistics"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
+        types.InlineKeyboardButton("💵 Add/Remove Balance", callback_data="admin_balance_edit"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("🧾 Orders", callback_data="admin_orders"),
+        types.InlineKeyboardButton("⚙️ Bot Settings", callback_data="admin_bot_settings"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("💰 Deposit Requests", callback_data="admin_deposit_requests"),
+        types.InlineKeyboardButton("📮 Deposit Numbers", callback_data="admin_deposit_numbers"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("📤 Export DB", callback_data="admin_export_db"),
+        types.InlineKeyboardButton("📥 Import DB", callback_data="admin_import_db"),
+    )
+    kb.add(types.InlineKeyboardButton("⬅️ Back to Menu", callback_data="admin_back_to_menu"))
+    return kb
+
+
+def bot_settings_inline():
+    """⚙️ Bot Settings সাব-মেনু: বর্তমান ভ্যালুসহ বাটন দেখায়, চাপলে বদলানো যায়।"""
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton(
+            f"🎁 Referral Bonus: {bot_settings['referral_bonus']} BDT",
+            callback_data="settings_referral_bonus",
+        )
+    )
+    kb.add(
+        types.InlineKeyboardButton(
+            f"💳 Deposit Limit: {bot_settings['min_deposit']} - {bot_settings['max_deposit']} BDT",
+            callback_data="settings_deposit_limits",
+        )
+    )
+    kb.add(
+        types.InlineKeyboardButton(
+            "💳 Deposit Methods: " + ", ".join(bot_settings["deposit_methods"]),
+            callback_data="settings_deposit_methods",
+        )
+    )
+    kb.add(
+        types.InlineKeyboardButton(
+            "🛠️ Maintenance Mode: " + ("✅ ON" if bot_settings["maintenance_mode"] else "❌ OFF"),
+            callback_data="settings_toggle_maintenance",
+        )
+    )
+    kb.add(types.InlineKeyboardButton("⬅️ Back", callback_data="settings_back"))
+    return kb
+
+
+# ---------------------------------------------------------------------------
+# TEXT TEMPLATES
+# ---------------------------------------------------------------------------
+def profile_text(u):
+    """প্রোফাইলের ডিটেইলস Bold লেবেল + <code> (monospace) ভ্যালু ফরম্যাটে।"""
+    return (
+        f"👤 <b>Profile</b>\n\n"
+        f"🆔 <b>User ID:</b> <code>{u['id']}</code>\n"
+        f"👤 <b>Full Name:</b> <code>{u['full_name']}</code>\n"
+        f"📝 <b>Username:</b> <code>{u['username']}</code>\n"
+        f"💰 <b>Balance:</b> <code>{fmt_amount(u['balance'])}</code>\n"
+        f"📊 <b>Total Purchased:</b> <code>{u['total_purchased']}</code>\n"
+        f"💸 <b>Today Spent:</b> <code>{fmt_amount(u['today_spent'])}</code>\n"
+        f"💳 <b>Today Deposit:</b> <code>{fmt_amount(u['today_deposit'])}</code>"
+    )
+
+
+def referral_text(user_id, data):
+    return (
+        "🎁 <b>Referral Program</b>\n\n\n"
+        f"🎁 Your Referral Link:\nhttps://t.me/{BOT_USERNAME}?start={user_id}\n\n"
+        f"💰 Bonus per referral: {fmt_amount(bot_settings['referral_bonus'])}\n"
+        f"👥 Total referrals: {data['referrals']}\n"
+        f"💵 Total earned: {fmt_amount(data['earned'])}"
+    )
+
+
+def product_detail_text(p):
+    return (
+        f"<b>{p['name']}</b>\n\n"
+        f"💵 Price: {fmt_amount(p['price'])}\n"
+        f"📦 Total Stock: {p['stock']}\n"
+        f"📝 Description: {p['description']}"
+    )
+
+
+def otp_link_display(otp_link):
+    """আসল URL হলে ক্লিকযোগ্য লিংক হিসেবে, না হলে (যেমন 'N/A' বা placeholder) mono টেক্সট হিসেবে দেখায়।"""
+    if otp_link and str(otp_link).startswith(("http://", "https://")):
+        return f'<a href="{otp_link}">🔗 OTP Link</a>'
+    return f"<code>{otp_link}</code>"
+
+
+def purchase_success_text(order):
+    return (
+        "🎉 <b>Purchase Successful!</b>\n\n"
+        f"🆔 <b>Order ID:</b> <code>{order['order_id']}</code>\n"
+        f"📦 <b>Product:</b> <code>{order['product_name']}</code>\n"
+        f"🔢 <b>Quantity:</b> <code>{order['qty']} pcs</code>\n"
+        f"💵 <b>Per piece:</b> <code>{fmt_amount(order['price'])}</code>\n"
+        f"💰 <b>Total:</b> <code>{fmt_amount(order['total'])}</code>\n"
+        f"💳 <b>Remaining Balance:</b> <code>{fmt_amount(order['remaining_balance'])}</code>\n"
+        f"📅 <b>Date:</b> <code>{order['date']}</code>\n\n"
+        f"👨‍💻 <b>Number:</b> <code>{order.get('number', 'N/A')}</code>\n"
+        f"📥 <b>OTP Link:</b> {otp_link_display(order.get('otp_link', 'N/A'))}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# /start
+# ---------------------------------------------------------------------------
+@bot.message_handler(commands=["start"])
+def cmd_start(message):
+    if maintenance_block(message):
+        return
+
+    uid = message.from_user.id
+    is_new_user = uid not in users
+
+    u = get_user(message)
+    u["id"] = uid
+    user_state[uid] = {"menu": "main"}
+
+    # --- Referral: /start <referrer_id> ---
+    parts = (message.text or "").split(maxsplit=1)
+    if is_new_user and len(parts) > 1 and parts[1].strip().isdigit():
+        referrer_id = int(parts[1].strip())
+        if referrer_id != uid and referrer_id in users and not u.get("referred_by"):
+            u["referred_by"] = referrer_id
+            referrer = users[referrer_id]
+            bonus = bot_settings["referral_bonus"]
+            referrer["referrals"] += 1
+            referrer["earned"] += bonus
+            referrer["balance"] += bonus
+            try:
+                bot.send_message(
+                    referrer_id,
+                    "🎉 <b>New Referral!</b>\n\n"
+                    f"আপনার লিংক দিয়ে একজন নতুন ইউজার জয়েন করেছে।\n"
+                    f"💰 বোনাস যুক্ত হয়েছে: {fmt_amount(bonus)}",
+                )
+            except Exception:
+                pass  # referrer হয়তো বটকে ব্লক করেছে
+
+    bot.send_message(message.chat.id, profile_text(u), reply_markup=main_menu_keyboard(u["id"]))
+
+
+# ---------------------------------------------------------------------------
+# MAIN MENU (Reply keyboard) HANDLERS
+# ---------------------------------------------------------------------------
+@bot.message_handler(func=lambda m: m.text == "🛒 Buy Number")
+def menu_buy_number(message):
+    if maintenance_block(message):
+        return
+    user_state[message.from_user.id] = {"menu": "buy_number"}
+    bot.send_message(message.chat.id, "Select number type:", reply_markup=buy_number_type_inline())
+
+
+@bot.message_handler(func=lambda m: m.text == "👤 Profile")
+def menu_profile(message):
+    if maintenance_block(message):
+        return
+    u = get_user(message)
+    u["id"] = message.from_user.id
+    user_state[message.from_user.id] = {"menu": "profile"}
+    bot.send_message(message.chat.id, profile_text(u), reply_markup=main_menu_keyboard(u["id"]))
+
+
+@bot.message_handler(func=lambda m: m.text == "💳 Deposit")
+def menu_deposit(message):
+    if maintenance_block(message):
+        return
+    user_state[message.from_user.id] = {"menu": "deposit"}
+    limit_line = ""
+    if bot_settings["min_deposit"] or bot_settings["max_deposit"]:
+        limit_line = (
+            f"📉 Min Deposit: {fmt_amount(bot_settings['min_deposit'])}\n"
+            f"📈 Max Deposit: {fmt_amount(bot_settings['max_deposit'])}\n\n"
+        )
+    bot.send_message(
+        message.chat.id,
+        "💳 <b>Deposit</b>\n\n" + limit_line + "নিচ থেকে পেমেন্ট মেথড বেছে নিন:",
+        reply_markup=deposit_methods_inline(),
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("depmethod_") or c.data == "dep_back")
+def cb_deposit_method_select(call):
+    if maintenance_block(call):
+        bot.answer_callback_query(call.id)
+        return
+    bot.answer_callback_query(call.id)
+    uid = call.from_user.id
+    chat_id = call.message.chat.id
+
+    if call.data == "dep_back":
+        user_state[uid] = {"menu": "main"}
+        bot.send_message(chat_id, "🏠 Main Menu", reply_markup=main_menu_keyboard(uid))
+        return
+
+    method = call.data.replace("depmethod_", "")
+    if method not in bot_settings["deposit_methods"]:
+        bot.send_message(chat_id, "⚠️ এই মেথডটি আর available নেই। আবার Deposit মেনু থেকে চেষ্টা করুন।")
+        return
+
+    user_state[uid] = {"menu": "deposit_amount", "method": method}
+
+    num = bot_settings["deposit_numbers"].get(method)
+    num_line = f"📮 এই নাম্বার/অ্যাড্রেসে টাকা পাঠান: <code>{num}</code>\n\n" if num else ""
+
+    bot.send_message(
+        chat_id,
+        f"💳 <b>{method} Deposit</b>\n\n{num_line}Deposit করার amount লিখে পাঠান (শুধু সংখ্যা):",
+        reply_markup=deposit_cancel_inline(),
+    )
+    bot.register_next_step_handler(call.message, process_deposit_amount)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "deposit_cancel")
+def cb_deposit_cancel(call):
+    """Deposit amount ইনপুট ধাপে Cancel বাটনে ক্লিক করলে pending input বাতিল করে
+    একই মেসেজটা এডিট করে Cancel error message দেখায়।"""
+    uid = call.from_user.id
+    bot.answer_callback_query(call.id)
+    bot.clear_step_handler_by_chat_id(call.message.chat.id)
+    user_state[uid] = {"menu": "main"}
+    bot.edit_message_text(
+        "❌ <b>Deposit Cancelled!</b>\n\nDeposit প্রক্রিয়াটি বাতিল করা হয়েছে।",
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        reply_markup=None,
+    )
+
+
+def process_deposit_amount(message):
+    """ইউজারের দেওয়া amount validate করে min/max লিমিট চেক করে, তারপর TrxID চায়।"""
+    uid = message.from_user.id
+    text = (message.text or "").strip()
+
+    if text in ["⬅️ Back", "⬅️ Back to Menu"]:
+        go_back(message)
+        return
+
+    state = user_state.get(uid, {})
+    method = state.get("method")
+    if state.get("menu") != "deposit_amount" or not method:
+        bot.send_message(message.chat.id, "⚠️ আগে 💳 Deposit মেনু থেকে একটা মেথড বেছে নিন।")
+        return
+
+    try:
+        amount = float(text)
+    except ValueError:
+        amount = None
+
+    if amount is None or amount <= 0:
+        bot.send_message(message.chat.id, "⚠️ সঠিক amount সংখ্যায় লিখুন (যেমন: 100)।")
+        bot.register_next_step_handler(message, process_deposit_amount)
+        return
+
+    min_dep = bot_settings["min_deposit"]
+    max_dep = bot_settings["max_deposit"]
+    if min_dep and amount < min_dep:
+        bot.send_message(message.chat.id, f"⚠️ Minimum deposit amount {fmt_amount(min_dep)}। আবার লিখুন।")
+        bot.register_next_step_handler(message, process_deposit_amount)
+        return
+    if max_dep and amount > max_dep:
+        bot.send_message(message.chat.id, f"⚠️ Maximum deposit amount {fmt_amount(max_dep)}। আবার লিখুন।")
+        bot.register_next_step_handler(message, process_deposit_amount)
+        return
+
+    if amount == int(amount):
+        amount = int(amount)
+
+    user_state[uid] = {"menu": "deposit_trxid", "method": method, "amount": amount}
+    bot.send_message(
+        message.chat.id,
+        f"💳 {method} — Amount: {fmt_amount(amount)}\n\nএখন Transaction ID (TrxID) লিখে পাঠান:",
+    )
+    bot.register_next_step_handler(message, process_deposit_trxid)
+
+
+def process_deposit_trxid(message):
+    """TrxID নিয়ে deposit রিকোয়েস্ট তৈরি করে — ম্যানুয়াল মেথড হলে Admin রিভিউতে
+    পাঠায়, নাহলে সাথে সাথে ব্যালেন্স যোগ করে অটো-অ্যাপ্রুভ করে দেয়।"""
+    uid = message.from_user.id
+    text = (message.text or "").strip()
+
+    if text in ["⬅️ Back", "⬅️ Back to Menu"]:
+        go_back(message)
+        return
+
+    state = user_state.get(uid, {})
+    method = state.get("method")
+    amount = state.get("amount")
+    if state.get("menu") != "deposit_trxid" or not method or amount is None:
+        bot.send_message(message.chat.id, "⚠️ আগে 💳 Deposit মেনু থেকে আবার শুরু করুন।")
+        return
+
+    trx_id = text
+    if not trx_id:
+        bot.send_message(message.chat.id, "⚠️ সঠিক Transaction ID লিখুন।")
+        bot.register_next_step_handler(message, process_deposit_trxid)
+        return
+
+    u = get_user(message)
+    u["id"] = uid
+
+    dep_id = _next_deposit_id()
+    dep = {
+        "id": dep_id,
+        "user_id": uid,
+        "method": method,
+        "amount": amount,
+        "trx_id": trx_id,
+        "status": "pending",
+        "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    deposits[dep_id] = dep
+    user_state[uid] = {"menu": "main"}
+
+    # -----------------------------------------------------------------
+    # bKash / Nagad / Rocket / Binance -> প্রথমে চেক হয় SMS Forwarder থেকে আগে
+    # থেকেই কোনো ম্যাচিং SMS এসে গেছে কিনা (ইউজার SMS আসার পরে TrxID লিখলে) —
+    # মিললে সাথে সাথে অটো-অ্যাপ্রুভ, ভুল তথ্য দিলে সাথে সাথে reject। কোনো
+    # ম্যাচ না পেলে (SMS এখনো আসেনি) Admin Approve/Reject এর জন্য pending থাকবে।
+    # বাকি সব (অন্য যেকোনো) মেথড -> সাথে সাথে অটো-অ্যাপ্রুভ, SMS লাগে না।
+    # -----------------------------------------------------------------
+    if method in DEPOSIT_MANUAL_METHODS:
+        sms_match = try_auto_approve_from_stored_sms(dep)
+        if sms_match in ("approved", "rejected_mismatch"):
+            # ইউজার/এডমিন নোটিফিকেশন try_auto_approve_from_stored_sms() থেকেই পাঠানো হয়ে গেছে
+            return
+
+        bot.send_message(
+            message.chat.id,
+            "⏳ <b>Deposit request submitted!</b>\n\n"
+            f"🆔 Request: DEP-{dep_id}\n"
+            f"💳 Method: {method}\n"
+            f"💰 Amount: {fmt_amount(amount)}\n"
+            f"🧾 TrxID: {trx_id}\n\n"
+            "Admin ভেরিফাই করার পর ব্যালেন্স যুক্ত হবে। (SMS ম্যাচ পেলে সাথে সাথেই অটো-অ্যাপ্রুভ হয়ে যাবে।)",
+            reply_markup=main_menu_keyboard(uid),
+        )
+        admin_text = (
+            "💰 <b>New Deposit Request</b>\n\n"
+            f"🆔 Request: DEP-{dep_id}\n"
+            f"👤 User: {u['full_name']} ({u['username']}) | <code>{uid}</code>\n"
+            f"💳 Method: {method}\n"
+            f"💰 Amount: {fmt_amount(amount)}\n"
+            f"🧾 TrxID: <code>{trx_id}</code>"
+        )
+        for admin_id in ADMIN_IDS:
+            try:
+                bot.send_message(admin_id, admin_text, reply_markup=deposit_review_inline(dep_id))
+            except Exception:
+                pass
+    else:
+        dep["status"] = "approved"
+        u["balance"] += amount
+        u["today_deposit"] += amount
+        bot.send_message(
+            message.chat.id,
+            "✅ <b>Deposit Auto-Approved!</b>\n\n"
+            f"🆔 Request: DEP-{dep_id}\n"
+            f"💳 Method: {method}\n"
+            f"💰 +{fmt_amount(amount)} added\n"
+            f"💰 New Balance: {fmt_amount(u['balance'])}",
+            reply_markup=main_menu_keyboard(uid),
+        )
+        for admin_id in ADMIN_IDS:
+            try:
+                bot.send_message(
+                    admin_id,
+                    "🤖 <b>Auto-Approved Deposit</b>\n\n"
+                    f"🆔 DEP-{dep_id} | 👤 <code>{uid}</code> | 💳 {method} | "
+                    f"💰 {fmt_amount(amount)} | 🧾 {trx_id}",
+                )
+            except Exception:
+                pass
+
+
+@bot.callback_query_handler(
+    func=lambda c: (c.data.startswith("depapprove_") or c.data.startswith("depreject_"))
+    and is_admin(c.from_user.id)
+)
+def cb_deposit_review(call):
+    """Admin এর Approve/Reject বাটনে ক্লিক হ্যান্ডল করে।"""
+    bot.answer_callback_query(call.id)
+    chat_id = call.message.chat.id
+
+    if call.data.startswith("depapprove_"):
+        action = "approve"
+        dep_id = int(call.data.replace("depapprove_", ""))
+    else:
+        action = "reject"
+        dep_id = int(call.data.replace("depreject_", ""))
+
+    dep = deposits.get(dep_id)
+    if not dep:
+        bot.send_message(chat_id, "⚠️ এই Deposit Request খুঁজে পাওয়া যায়নি।")
+        return
+    if dep["status"] != "pending":
+        bot.send_message(chat_id, f"⚠️ এই Deposit ইতিমধ্যে '{dep['status']}' করা হয়ে গেছে।")
+        return
+
+    user_id = dep["user_id"]
+    u = users.get(user_id)
+
+    if action == "approve":
+        dep["status"] = "approved"
+        if u is not None:
+            u["balance"] += dep["amount"]
+            u["today_deposit"] += dep["amount"]
+        bot.send_message(chat_id, f"✅ DEP-{dep_id} Approved হয়েছে।")
+        try:
+            bot.send_message(
+                user_id,
+                "✅ <b>Deposit Approved!</b>\n\n"
+                f"🆔 Request: DEP-{dep_id}\n"
+                f"💰 +{fmt_amount(dep['amount'])} added\n"
+                + (f"💰 New Balance: {fmt_amount(u['balance'])}" if u else ""),
+            )
+        except Exception:
+            pass
+    else:
+        dep["status"] = "rejected"
+        bot.send_message(chat_id, f"❌ DEP-{dep_id} Rejected হয়েছে।")
+        try:
+            bot.send_message(
+                user_id,
+                f"❌ <b>Deposit Rejected.</b>\n\n🆔 Request: DEP-{dep_id}\nProblem হলে Support এ যোগাযোগ করুন।",
+            )
+        except Exception:
+            pass
+
+
+@bot.message_handler(func=lambda m: m.text == "🎁 Referral")
+def menu_referral(message):
+    if maintenance_block(message):
+        return
+    u = get_user(message)
+    u["id"] = message.from_user.id
+    user_state[message.from_user.id] = {"menu": "referral"}
+    bot.send_message(
+        message.chat.id,
+        referral_text(u["id"], u),
+        reply_markup=referral_inline(),
+    )
+
+
+@bot.message_handler(func=lambda m: m.text == "🆘 Support")
+def menu_support(message):
+    if maintenance_block(message):
+        return
+    user_state[message.from_user.id] = {"menu": "support"}
+    # TODO: real support username/link
+    bot.send_message(
+        message.chat.id,
+        "🆘 <b>Support</b>\n\nযেকোনো সমস্যায় যোগাযোগ করুন: @your_support_username",
+        reply_markup=back_to_main_keyboard(),
+    )
+
+
+@bot.message_handler(func=lambda m: m.text == "⚙️ Method")
+def menu_method(message):
+    if maintenance_block(message):
+        return
+    user_state[message.from_user.id] = {"menu": "method"}
+    lines = ["⚙️ <b>Payment Method</b>\n"]
+    for m in bot_settings["deposit_methods"]:
+        tag = "🧑‍💻 Manual (Admin Review)" if m in DEPOSIT_MANUAL_METHODS else "🤖 Auto-Approve"
+        num = bot_settings["deposit_numbers"].get(m)
+        num_line = f" — <code>{num}</code>" if num else ""
+        lines.append(f"• {m}{num_line} — {tag}")
+    bot.send_message(message.chat.id, "\n".join(lines), reply_markup=back_to_main_keyboard())
+
+
+@bot.message_handler(func=lambda m: m.text in ["⬅️ Back to Menu", "⬅️ Back"])
+def go_back(message):
+    """সব জায়গা থেকে ধাপে ধাপে Back করার লজিক।"""
+    uid = message.from_user.id
+
+    # Buy Number মেনুর যেকোনো ধাপ (product select / product detail / bulk buy ইনপুট) থেকে
+    # Back চাপলে সরাসরি Main Menu তে ফিরে যেতে হবে।
+    # সব জায়গা থেকে -> main menu
+    u = get_user(message)
+    u["id"] = uid
+    user_state[uid] = {"menu": "main"}
+    bot.send_message(message.chat.id, "🏠 Main Menu", reply_markup=main_menu_keyboard(uid))
+
+
+# ---------------------------------------------------------------------------
+# INLINE CALLBACKS: product selection (WhatsApp / Telegram)
+# ---------------------------------------------------------------------------
+def show_product_detail(chat_id, uid, product_key):
+    """প্রোডাক্ট ডিটেইলস + buy মেনু (Buy one pcs/Bulk Buy/Back) দেখায়।
+    প্রথমবার প্রোডাক্ট সিলেক্ট করার সময় এবং Bulk Buy থেকে Back করার সময় দুই জায়গাতেই ব্যবহার হয়।"""
+    p = products.get(product_key)
+    if not p:
+        return
+    user_state[uid] = {"menu": "product_detail", "product": product_key}
+    bot.send_message(chat_id, product_detail_text(p))
+    bot.send_message(chat_id, "Please choose an option below:", reply_markup=product_detail_keyboard())
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("prod_"))
+def cb_product_select(call):
+    if maintenance_block(call):
+        bot.answer_callback_query(call.id)
+        return
+    product_key = call.data.replace("prod_", "")   # "whatsapp" / "telegram"
+    p = products.get(product_key)
+    if not p:
+        bot.answer_callback_query(call.id, "Product not found.")
+        return
+
+    bot.answer_callback_query(call.id)
+    show_product_detail(call.message.chat.id, call.from_user.id, product_key)
+
+
+# ---------------------------------------------------------------------------
+# PRODUCT DETAIL MENU: Buy one pcs / Bulk Buy
+# ---------------------------------------------------------------------------
+@bot.message_handler(func=lambda m: m.text == "🛍️ Buy one pcs")
+def buy_one_pcs(message):
+    if maintenance_block(message):
+        return
+    uid = message.from_user.id
+    state = user_state.get(uid, {})
+    product_key = state.get("product")
+    p = products.get(product_key)
+
+    if not p:
+        bot.send_message(message.chat.id, "⚠️ আগে একটা প্রোডাক্ট সিলেক্ট করুন।")
+        return
+
+    u = get_user(message)
+    u["id"] = uid
+
+    # --- validation ---
+    if p["price"] <= 0:
+        bot.send_message(message.chat.id, "⚠️ এই প্রোডাক্টের দাম এখনও সেট করা হয়নি। এডমিনের সাথে যোগাযোগ করুন।")
+        return
+
+    stock_list = p.setdefault("stock_list", [])
+    if not stock_list:
+        bot.send_message(
+            message.chat.id,
+            "❌ <b>Stock Out!</b>\n\nদুঃখিত, এই প্রোডাক্টের স্টক এখন খালি। কিছুক্ষণ পরে চেষ্টা করুন।",
+            reply_markup=product_detail_keyboard(),
+        )
+        return
+
+    if u["balance"] < p["price"]:
+        bot.send_message(
+            message.chat.id,
+            "❌ <b>Insufficient Balance!</b>\n\n"
+            f"💰 আপনার ব্যালেন্স: {fmt_amount(u['balance'])}\n"
+            f"💵 প্রয়োজন: {fmt_amount(p['price'])}\n\n"
+            "অনুগ্রহ করে আগে Deposit করুন।",
+            reply_markup=product_detail_keyboard(),
+        )
+        return
+
+    # --- fulfill purchase (real balance + stock deduction) ---
+    item = stock_list.pop(0)
+    p["stock"] = len(stock_list)   # TODO: database তে persist করুন (এখনো in-memory)
+
+    u["balance"] -= p["price"]
+    u["total_purchased"] += 1
+    u["today_spent"] += p["price"]
+
+    order_id = f"ORD-{uuid.uuid4().hex[:8].upper()}"
+    order = {
+        "order_id": order_id,
+        "user_id": uid,
+        "product_name": p["name"],
+        "qty": 1,
+        "price": p["price"],
+        "total": p["price"],
+        "remaining_balance": u["balance"],
+        "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "number": item["number"],
+        "otp_link": item["otp_link"],
+    }
+    orders[order_id] = order
+
+    bot.send_message(message.chat.id, purchase_success_text(order), reply_markup=product_detail_keyboard())
+
+
+@bot.message_handler(func=lambda m: m.text == "📦 Bulk Buy")
+def bulk_buy(message):
+    if maintenance_block(message):
+        return
+    uid = message.from_user.id
+    state = user_state.get(uid, {})
+    product_key = state.get("product")
+    p = products.get(product_key)
+
+    if not p:
+        bot.send_message(message.chat.id, "⚠️ আগে একটা প্রোডাক্ট সিলেক্ট করুন।")
+        return
+
+    if p["price"] <= 0:
+        bot.send_message(message.chat.id, "⚠️ এই প্রোডাক্টের দাম এখনও সেট করা হয়নি। এডমিনের সাথে যোগাযোগ করুন।")
+        return
+
+    stock_list = p.setdefault("stock_list", [])
+    if not stock_list:
+        bot.send_message(
+            message.chat.id,
+            "❌ <b>Stock Out!</b>\n\nদুঃখিত, এই প্রোডাক্টের স্টক এখন খালি।",
+            reply_markup=product_detail_keyboard(),
+        )
+        return
+
+    bot.send_message(
+        message.chat.id,
+        "📦 <b>Bulk Buy</b>\n\n"
+        f"📊 বর্তমান স্টক: {len(stock_list)} পিস\n"
+        f"💵 প্রতি পিস: {fmt_amount(p['price'])}\n\n"
+        "কত পিস কিনতে চান, সংখ্যায় লিখে পাঠান (যেমন: 5):",
+        reply_markup=back_only_keyboard(),
+    )
+    bot.register_next_step_handler(message, process_bulk_quantity)
+
+
+def process_bulk_quantity(message):
+    """Bulk Buy এর quantity ইনপুট প্রসেস করে, balance/stock check করে অর্ডার সম্পন্ন করে।"""
+    uid = message.from_user.id
+    text = (message.text or "").strip()
+    state = user_state.get(uid, {})
+
+    # Bulk Buy ধাপ থেকে Back চাপলে main menu তে না গিয়ে buy মেনুতে (product detail) ফিরে যায়
+    if text in ["⬅️ Back", "⬅️ Back to Menu"]:
+        product_key = state.get("product")
+        if product_key and products.get(product_key):
+            show_product_detail(message.chat.id, uid, product_key)
+        else:
+            go_back(message)
+        return
+
+    product_key = state.get("product")
+    p = products.get(product_key)
+    if not p:
+        bot.send_message(message.chat.id, "⚠️ আগে একটা প্রোডাক্ট সিলেক্ট করুন।")
+        return
+
+    if not text.isdigit() or int(text) <= 0:
+        bot.send_message(message.chat.id, "⚠️ সঠিক একটি সংখ্যা লিখুন (যেমন: 5)।")
+        bot.register_next_step_handler(message, process_bulk_quantity)
+        return
+
+    qty = int(text)
+    stock_list = p.setdefault("stock_list", [])
+
+    if qty > len(stock_list):
+        bot.send_message(
+            message.chat.id,
+            "❌ <b>Stock Not Enough!</b>\n\n"
+            f"📦 বর্তমান স্টক: {len(stock_list)} পিস\nএর বেশি পরিমাণ এখন কেনা সম্ভব নয়।",
+            reply_markup=product_detail_keyboard(),
+        )
+        return
+
+    u = get_user(message)
+    u["id"] = uid
+    total_price = p["price"] * qty
+
+    if u["balance"] < total_price:
+        bot.send_message(
+            message.chat.id,
+            "❌ <b>Insufficient Balance!</b>\n\n"
+            f"💰 আপনার ব্যালেন্স: {fmt_amount(u['balance'])}\n"
+            f"💵 প্রয়োজন: {fmt_amount(total_price)} ({qty} x {p['price']})\n\n"
+            "অনুগ্রহ করে আগে Deposit করুন।",
+            reply_markup=product_detail_keyboard(),
+        )
+        return
+
+    # --- fulfill purchase (real balance + stock deduction) ---
+    purchased_items = [stock_list.pop(0) for _ in range(qty)]
+    p["stock"] = len(stock_list)   # TODO: database তে persist করুন (এখনো in-memory)
+
+    u["balance"] -= total_price
+    u["total_purchased"] += qty
+    u["today_spent"] += total_price
+
+    order_id = f"ORD-{uuid.uuid4().hex[:8].upper()}"
+    order = {
+        "order_id": order_id,
+        "user_id": uid,
+        "product_name": p["name"],
+        "qty": qty,
+        "price": p["price"],
+        "total": total_price,
+        "remaining_balance": u["balance"],
+        "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "number": purchased_items[0]["number"] if qty == 1 else "📎 নিচের ফাইলে দেখুন",
+        "otp_link": purchased_items[0]["otp_link"] if qty == 1 else "📎 নিচের ফাইলে দেখুন",
+        "items": purchased_items,
+    }
+    orders[order_id] = order
+
+    if qty > 1:
+        bot.send_message(message.chat.id, purchase_success_text(order))
+        bot.send_message(
+            message.chat.id,
+            "📦 আপনি কোন ফরম্যাটে ফাইল নিতে চান?",
+            reply_markup=bulk_file_format_inline(order_id),
+        )
+        bot.send_message(message.chat.id, "আরও কিছু কিনতে চাইলে নিচ থেকে বেছে নিন:", reply_markup=product_detail_keyboard())
+    else:
+        bot.send_message(message.chat.id, purchase_success_text(order), reply_markup=product_detail_keyboard())
+
+
+def bulk_file_format_inline(order_id):
+    """Bulk Buy এর পর ইউজার কোন ফরম্যাটে ডেটা চান (TXT / CSV / Inline) সেটা বেছে নেওয়ার বাটন।"""
+    kb = types.InlineKeyboardMarkup(row_width=3)
+    kb.add(
+        types.InlineKeyboardButton("📄 TXT", callback_data=f"bulkfile_txt_{order_id}"),
+        types.InlineKeyboardButton("📊 CSV", callback_data=f"bulkfile_csv_{order_id}"),
+        types.InlineKeyboardButton("📋 Inline", callback_data=f"bulkfile_inline_{order_id}"),
+    )
+    return kb
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("bulkfile_"))
+def cb_bulk_file_format(call):
+    """Bulk Buy অর্ডারের আইটেমগুলো ইউজারের বেছে নেওয়া ফরম্যাটে (txt/csv/inline) পাঠায়।"""
+    uid = call.from_user.id
+    _, fmt, order_id = call.data.split("_", 2)
+    order = orders.get(order_id)
+    bot.answer_callback_query(call.id)
+
+    if not order or order.get("user_id") != uid:
+        bot.send_message(call.message.chat.id, "⚠️ অর্ডারটি খুঁজে পাওয়া যায়নি বা এটি আপনার অর্ডার নয়।")
+        return
+
+    items = order.get("items", [])
+    if not items:
+        bot.send_message(call.message.chat.id, "⚠️ এই অর্ডারে কোনো আইটেম পাওয়া যায়নি।")
+        return
+
+    product_key = next((k for k, pv in products.items() if pv["name"] == order["product_name"]), "items")
+
+    if fmt == "inline":
+        chunk_lines = [
+            f"{i+1}. <code>{it['number']}</code> | {otp_link_display(it['otp_link'])}"
+            for i, it in enumerate(items)
+        ]
+        header = f"📋 <b>আপনার {len(items)} টি {order['product_name']}</b>\n\n"
+        text = header
+        for line in chunk_lines:
+            if len(text) + len(line) + 1 > 3500:
+                bot.send_message(call.message.chat.id, text)
+                text = ""
+            text += line + "\n"
+        if text.strip():
+            bot.send_message(call.message.chat.id, text)
+        return
+
+    if fmt == "csv":
+        lines = ["number,otp_link"] + [f"{it['number']},{it['otp_link']}" for it in items]
+        filename = f"{order_id}_{product_key}.csv"
+    else:  # txt
+        lines = [f"{it['number']}|{it['otp_link']}" for it in items]
+        filename = f"{order_id}_{product_key}.txt"
+
+    file_content = "\n".join(lines).encode("utf-8")
+    bot.send_document(
+        call.message.chat.id,
+        io.BytesIO(file_content),
+        visible_file_name=filename,
+        caption=f"📥 আপনার {len(items)} টি {order['product_name']}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# ADMIN PANEL
+# ---------------------------------------------------------------------------
+@bot.message_handler(func=lambda m: m.text == "👮 Admin Panel" and is_admin(m.from_user.id))
+def menu_admin_panel(message):
+    user_state[message.from_user.id] = {"menu": "admin_panel"}
+    bot.send_message(message.chat.id, "👮 <b>Admin Panel</b>", reply_markup=admin_panel_inline())
+
+
+# ---------------------------------------------------------------------------
+# ADMIN PANEL: inline button callbacks
+# ---------------------------------------------------------------------------
+@bot.callback_query_handler(func=lambda c: c.data.startswith("admin_") and is_admin(c.from_user.id))
+def cb_admin_panel(call):
+    uid = call.from_user.id
+    data = call.data
+    chat_id = call.message.chat.id
+    bot.answer_callback_query(call.id)
+
+    if data == "admin_upload_file":
+        user_state[uid] = {"menu": "admin_upload_file_select"}
+        bot.send_message(
+            chat_id,
+            "📤 কোন প্রোডাক্টের জন্য স্টক ফাইল আপলোড করবেন?",
+            reply_markup=upload_file_product_inline(),
+        )
+
+    elif data == "admin_set_price_stock":
+        user_state[uid] = {"menu": "admin_set_price_select"}
+        bot.send_message(
+            chat_id,
+            "💰 কোন প্রোডাক্টের price পরিবর্তন করবেন?",
+            reply_markup=set_price_product_inline(),
+        )
+
+    elif data == "admin_set_usd_rate":
+        user_state[uid] = {"menu": "admin_set_usd_rate"}
+        current = bot_settings.get("usd_rate") or 0
+        bot.send_message(
+            chat_id,
+            "💱 নতুন Dollar Rate লিখে পাঠান (1 USD = কত BDT)।\n"
+            f"বর্তমান রেট: {current if current else 'সেট করা নেই'}\n\n"
+            "উদাহরণ: 122 অথবা 121.50",
+        )
+        bot.register_next_step_handler(call.message, process_set_usd_rate)
+
+    elif data == "admin_users_list":
+        # TODO: pagination সহ real user list
+        bot.send_message(chat_id, f"👥 মোট ইউজার: {len(users)}\n(তালিকা লজিক পরে যুক্ত হবে)")
+
+    elif data == "admin_statistics":
+        # TODO: real total sales, revenue, today stats ইত্যাদি
+        bot.send_message(
+            chat_id,
+            "📊 <b>Statistics</b>\n\n"
+            f"👥 Total Users: {len(users)}\n"
+            f"🧾 Total Orders: {len(orders)}\n"
+            "💰 Total Revenue: TODO\n"
+            "📅 Today's Sales: TODO",
+        )
+
+    elif data == "admin_broadcast":
+        user_state[uid] = {"menu": "admin_broadcast"}
+        bot.send_message(chat_id, "📢 যে মেসেজটি সব ইউজারকে পাঠাতে চান লিখুন।")
+        bot.register_next_step_handler(call.message, process_broadcast_message)
+
+    elif data == "admin_balance_edit":
+        # TODO: user_id চাইবে, তারপর amount +/- করবে
+        bot.send_message(chat_id, "💵 Balance যোগ/বিয়োগ করার লজিক এখানে যুক্ত হবে।")
+
+    elif data == "admin_orders":
+        # TODO: pagination সহ real orders list / filter
+        bot.send_message(chat_id, f"🧾 মোট অর্ডার: {len(orders)}\n(তালিকা লজিক পরে যুক্ত হবে)")
+
+    elif data == "admin_export_db":
+        payload = _build_db_export_payload()
+        try:
+            json_bytes = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        except Exception as e:
+            bot.send_message(chat_id, f"❌ Export করতে সমস্যা হয়েছে: {e}")
+        else:
+            filename = f"db_backup_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            bot.send_document(
+                chat_id,
+                io.BytesIO(json_bytes),
+                visible_file_name=filename,
+                caption=(
+                    "📤 <b>DB Export সম্পন্ন!</b>\n\n"
+                    f"👥 Users: {len(users)}\n"
+                    f"🧾 Orders: {len(orders)}\n"
+                    f"💰 Deposits: {len(deposits)}\n"
+                    f"📩 SMS Log: {len(sms_log)}\n\n"
+                    "⚠️ এই ফাইলে ইউজারদের ব্যালেন্স/ডেটা থাকে — নিরাপদ জায়গায় রাখুন।"
+                ),
+            )
+
+    elif data == "admin_import_db":
+        user_state[uid] = {"menu": "admin_import_db_wait_file"}
+        bot.send_message(
+            chat_id,
+            "📥 <b>DB Import</b>\n\n"
+            "⚠️ এটা করলে বর্তমান সব ডেটা (Users/ব্যালেন্স/Orders/Deposits/SMS Log) মুছে "
+            "আপলোড করা ব্যাকআপ (.json) ফাইল দিয়ে রিপ্লেস হয়ে যাবে।\n\n"
+            "আগে এই বটের Export করা .json ব্যাকআপ ফাইলটা পাঠান।",
+            reply_markup=back_to_main_keyboard(),
+        )
+
+    elif data == "admin_deposit_requests":
+        pending = [d for d in deposits.values() if d["status"] == "pending"]
+        if not pending:
+            bot.send_message(chat_id, "💰 <b>Pending Deposits</b>\n\nএখন কোনো pending deposit নেই।")
+        else:
+            for d in pending[:20]:
+                du = users.get(d["user_id"], {})
+                bot.send_message(
+                    chat_id,
+                    "💰 <b>Pending Deposit</b>\n\n"
+                    f"🆔 DEP-{d['id']}\n"
+                    f"👤 User: {du.get('full_name', '—')} | <code>{d['user_id']}</code>\n"
+                    f"💳 Method: {d['method']}\n"
+                    f"💰 Amount: {fmt_amount(d['amount'])}\n"
+                    f"🧾 TrxID: <code>{d['trx_id']}</code>\n"
+                    f"📅 {d['date']}",
+                    reply_markup=deposit_review_inline(d["id"]),
+                )
+
+    elif data == "admin_deposit_numbers":
+        user_state[uid] = {"menu": "admin_deposit_numbers"}
+        bot.send_message(
+            chat_id,
+            "📮 <b>Deposit Payment Numbers</b>\n\nযে মেথডের নাম্বার/অ্যাড্রেস সেট করবেন সেটায় ক্লিক করুন।",
+            reply_markup=deposit_numbers_inline(),
+        )
+
+    elif data == "admin_bot_settings":
+        user_state[uid] = {"menu": "admin_bot_settings"}
+        bot.send_message(
+            chat_id,
+            "⚙️ <b>Bot Settings</b>\n\nযে সেটিংসটি বদলাতে চান, তাতে ক্লিক করুন।",
+            reply_markup=bot_settings_inline(),
+        )
+
+    elif data == "admin_back_to_menu":
+        user_state[uid] = {"menu": "main"}
+        bot.send_message(chat_id, "🏠 Main Menu", reply_markup=main_menu_keyboard(uid))
+
+
+# ---------------------------------------------------------------------------
+# ADMIN PANEL: ⚙️ Bot Settings সাব-মেনুর callbacks
+# ---------------------------------------------------------------------------
+@bot.callback_query_handler(func=lambda c: c.data.startswith("settings_") and is_admin(c.from_user.id))
+def cb_bot_settings(call):
+    uid = call.from_user.id
+    chat_id = call.message.chat.id
+    data = call.data
+    bot.answer_callback_query(call.id)
+
+    if data == "settings_back":
+        user_state[uid] = {"menu": "admin_panel"}
+        bot.send_message(chat_id, "👮 <b>Admin Panel</b>", reply_markup=admin_panel_inline())
+        return
+
+    if data == "settings_toggle_maintenance":
+        bot_settings["maintenance_mode"] = not bot_settings["maintenance_mode"]   # TODO: DB তে persist করুন
+        status = "চালু ✅" if bot_settings["maintenance_mode"] else "বন্ধ ❌"
+        bot.send_message(
+            chat_id,
+            f"🛠️ Maintenance Mode এখন {status} করা হয়েছে।",
+            reply_markup=bot_settings_inline(),
+        )
+        return
+
+    if data == "settings_referral_bonus":
+        user_state[uid] = {"menu": "admin_settings_referral_bonus"}
+        bot.send_message(
+            chat_id,
+            "🎁 প্রতি রেফারেলে নতুন বোনাস অ্যামাউন্ট লিখে পাঠান।\n"
+            f"বর্তমান: {fmt_amount(bot_settings['referral_bonus'])}\n\n"
+            "উদাহরণ: 15 অথবা 20.50",
+        )
+        bot.register_next_step_handler(call.message, process_settings_referral_bonus)
+        return
+
+    if data == "settings_deposit_limits":
+        user_state[uid] = {"menu": "admin_settings_deposit_limits"}
+        bot.send_message(
+            chat_id,
+            "💳 Min ও Max Deposit লিখে পাঠান, কমা দিয়ে আলাদা করে।\n"
+            f"বর্তমান: {bot_settings['min_deposit']} , {bot_settings['max_deposit']}\n\n"
+            "উদাহরণ: 50,5000  (সীমা রাখতে না চাইলে 0,0 লিখুন)",
+        )
+        bot.register_next_step_handler(call.message, process_settings_deposit_limits)
+        return
+
+    if data == "settings_deposit_methods":
+        user_state[uid] = {"menu": "admin_settings_deposit_methods"}
+        bot.send_message(
+            chat_id,
+            "💳 কমা দিয়ে আলাদা করে Deposit Method গুলো লিখে পাঠান।\n"
+            f"বর্তমান: {', '.join(bot_settings['deposit_methods'])}\n\n"
+            "উদাহরণ: bKash,Nagad,Rocket,Binance,Manual Bank\n\n"
+            f"⚠️ শুধু {', '.join(DEPOSIT_MANUAL_METHODS)} — এই কয়টা মেথড সবসময় ম্যানুয়াল Admin "
+            "approval এ যাবে; বাকি যেকোনো নতুন মেথড (যেমন 'Manual Bank') যোগ করলে সেটা সাথে "
+            "সাথে অটো-অ্যাপ্রুভ হয়ে যাবে।",
+        )
+        bot.register_next_step_handler(call.message, process_settings_deposit_methods)
+        return
+
+
+def process_settings_deposit_methods(message):
+    uid = message.from_user.id
+    if not is_admin(uid):
+        return
+
+    text = (message.text or "").strip()
+    if text in ["⬅️ Back", "⬅️ Back to Menu"]:
+        go_back(message)
+        return
+
+    methods = [p.strip() for p in text.split(",") if p.strip()]
+    if not methods:
+        bot.send_message(message.chat.id, "⚠️ অন্তত একটা মেথড লিখুন।")
+        bot.register_next_step_handler(message, process_settings_deposit_methods)
+        return
+
+    bot_settings["deposit_methods"] = methods   # TODO: DB তে persist করুন
+    for m in methods:
+        bot_settings["deposit_numbers"].setdefault(m, "")
+
+    bot.send_message(
+        message.chat.id,
+        f"✅ Deposit Methods আপডেট হয়েছে: {', '.join(methods)}",
+        reply_markup=bot_settings_inline(),
+    )
+    user_state[uid] = {"menu": "admin_bot_settings"}
+
+
+def process_settings_referral_bonus(message):
+    uid = message.from_user.id
+    if not is_admin(uid):
+        return
+
+    text = (message.text or "").strip()
+    if text in ["⬅️ Back", "⬅️ Back to Menu"]:
+        go_back(message)
+        return
+
+    try:
+        new_bonus = float(text)
+    except ValueError:
+        new_bonus = None
+
+    if new_bonus is None or new_bonus < 0:
+        bot.send_message(message.chat.id, "⚠️ সঠিক একটি সংখ্যা লিখুন (যেমন: 15 অথবা 20.50)।")
+        bot.register_next_step_handler(message, process_settings_referral_bonus)
+        return
+
+    if new_bonus == int(new_bonus):
+        new_bonus = int(new_bonus)
+
+    bot_settings["referral_bonus"] = new_bonus   # TODO: DB তে persist করুন
+    bot.send_message(
+        message.chat.id,
+        f"✅ Referral Bonus আপডেট হয়েছে: {fmt_amount(new_bonus)}",
+        reply_markup=bot_settings_inline(),
+    )
+    user_state[uid] = {"menu": "admin_bot_settings"}
+
+
+def process_settings_deposit_limits(message):
+    uid = message.from_user.id
+    if not is_admin(uid):
+        return
+
+    text = (message.text or "").strip()
+    if text in ["⬅️ Back", "⬅️ Back to Menu"]:
+        go_back(message)
+        return
+
+    parts = [p.strip() for p in text.split(",")]
+    if len(parts) != 2 or not all(p.replace(".", "", 1).isdigit() for p in parts):
+        bot.send_message(message.chat.id, "⚠️ সঠিক ফরম্যাটে লিখুন, যেমন: 50,5000")
+        bot.register_next_step_handler(message, process_settings_deposit_limits)
+        return
+
+    min_dep, max_dep = float(parts[0]), float(parts[1])
+    min_dep = int(min_dep) if min_dep == int(min_dep) else min_dep
+    max_dep = int(max_dep) if max_dep == int(max_dep) else max_dep
+
+    if max_dep and min_dep > max_dep:
+        bot.send_message(message.chat.id, "⚠️ Min, Max এর থেকে বেশি হতে পারবে না। আবার লিখুন।")
+        bot.register_next_step_handler(message, process_settings_deposit_limits)
+        return
+
+    bot_settings["min_deposit"] = min_dep   # TODO: DB তে persist করুন
+    bot_settings["max_deposit"] = max_dep
+    bot.send_message(
+        message.chat.id,
+        f"✅ Deposit Limit আপডেট হয়েছে: {min_dep} - {max_dep} BDT",
+        reply_markup=bot_settings_inline(),
+    )
+    user_state[uid] = {"menu": "admin_bot_settings"}
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("depnum_") and is_admin(c.from_user.id))
+def cb_deposit_number_set_start(call):
+    method = call.data.replace("depnum_", "")
+    bot.answer_callback_query(call.id)
+    user_state[call.from_user.id] = {"menu": "admin_deposit_number_value", "method": method}
+    current = bot_settings["deposit_numbers"].get(method) or "সেট করা নেই"
+    bot.send_message(
+        call.message.chat.id,
+        f"📮 <b>{method}</b> এর জন্য নতুন Number/Address লিখে পাঠান।\nবর্তমান: {current}",
+    )
+    bot.register_next_step_handler(call.message, process_deposit_number_value)
+
+
+def process_deposit_number_value(message):
+    uid = message.from_user.id
+    if not is_admin(uid):
+        return
+
+    text = (message.text or "").strip()
+    if text in ["⬅️ Back", "⬅️ Back to Menu"]:
+        go_back(message)
+        return
+
+    state = user_state.get(uid, {})
+    method = state.get("method")
+    if not method:
+        bot.send_message(message.chat.id, "⚠️ মেথড খুঁজে পাওয়া যায়নি। আবার চেষ্টা করুন।")
+        user_state[uid] = {"menu": "admin_panel"}
+        return
+
+    bot_settings["deposit_numbers"][method] = text   # TODO: DB তে persist করুন
+    bot.send_message(
+        message.chat.id,
+        f"✅ {method} এর Number/Address আপডেট হয়েছে:\n<code>{text}</code>",
+        reply_markup=deposit_numbers_inline(),
+    )
+    user_state[uid] = {"menu": "admin_deposit_numbers"}
+
+
+def broadcast_to_all_users(text):
+    """সব ইউজারকে একটা মেসেজ পাঠায়, কতজনকে পাঠানো গেছে/ব্যর্থ হয়েছে তার কাউন্ট রিটার্ন করে।"""
+    sent, failed = 0, 0
+    for user_id in list(users.keys()):
+        try:
+            bot.send_message(user_id, text)
+            sent += 1
+        except Exception:
+            failed += 1  # ইউজার হয়তো বটকে ব্লক করেছে
+    return sent, failed
+
+
+def process_broadcast_message(message):
+    """Admin এর লেখা মেসেজ সব ইউজারকে broadcast করে।"""
+    uid = message.from_user.id
+    if not is_admin(uid):
+        return
+
+    text = (message.text or "").strip()
+
+    if text in ["⬅️ Back", "⬅️ Back to Menu"]:
+        go_back(message)
+        return
+
+    if not text:
+        bot.send_message(message.chat.id, "⚠️ মেসেজ খালি রাখা যাবে না। আবার লিখুন।")
+        bot.register_next_step_handler(message, process_broadcast_message)
+        return
+
+    sent, failed = broadcast_to_all_users(text)
+    bot.send_message(
+        message.chat.id,
+        "✅ <b>Broadcast সম্পন্ন!</b>\n\n"
+        f"👥 পাঠানো হয়েছে: {sent} জনকে\n"
+        f"❌ ব্যর্থ: {failed} জন",
+        reply_markup=admin_panel_inline(),
+    )
+    user_state[uid] = {"menu": "admin_panel"}
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("uploadprod_") and is_admin(c.from_user.id))
+def cb_admin_upload_product_select(call):
+    product_key = call.data.replace("uploadprod_", "")
+    p = products.get(product_key)
+    if not p:
+        bot.answer_callback_query(call.id, "Product not found.")
+        return
+
+    user_state[call.from_user.id] = {"menu": "admin_upload_file", "product": product_key}
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        call.message.chat.id,
+        f"📤 <b>{p['name']}</b> এর জন্য স্টক ফাইল পাঠান (.txt / .csv / .xlsx)।\n\n"
+        "📄 .txt বা .csv এ প্রতি লাইনে একটি এন্ট্রি এই ফরম্যাটে দিন:\n"
+        "<code>number|otp_link</code>\n\n"
+        "📊 .xlsx এ প্রথম কলামে number, দ্বিতীয় কলামে otp_link দিন।\n\n"
+        "OTP লিংক না থাকলে শুধু:\n"
+        "<code>number</code>\n\n"
+        "ফাইল পাঠানোর পর stock এ যুক্ত করার আগে আপনাকে confirm করতে বলা হবে।",
+    )
+
+
+def parse_stock_from_xlsx(file_bytes):
+    """xlsx ফাইলের প্রথম শীট থেকে (number, otp_link) কলাম দুটো রিড করে।
+    হেডার-জাতীয় লাইন (number/phone ইত্যাদি) স্বয়ংক্রিয়ভাবে স্কিপ হয়।"""
+    from openpyxl import load_workbook  # লেজি ইমপোর্ট: শুধু .xlsx আপলোড হলেই দরকার
+
+    wb = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
+    ws = wb.active
+    items = []
+    for row in ws.iter_rows(values_only=True):
+        if not row:
+            continue
+        number = row[0]
+        otp_link = row[1] if len(row) > 1 else None
+        if number is None:
+            continue
+        number = str(number).strip()
+        if not number or number.lower() in ("number", "phone", "phone number", "otp_link", "otp"):
+            continue
+        otp_link = str(otp_link).strip() if otp_link not in (None, "") else "N/A"
+        items.append({"number": number, "otp_link": otp_link})
+    return items
+
+
+@bot.message_handler(content_types=["document"])
+def handle_document_upload(message):
+    uid = message.from_user.id
+    if not is_admin(uid):
+        return
+    state = user_state.get(uid, {})
+    menu = state.get("menu")
+
+    if menu == "admin_import_db_wait_file":
+        handle_db_import_file(message)
+        return
+
+    if menu != "admin_upload_file":
+        return
+
+    product_key = state.get("product")
+    p = products.get(product_key)
+    if not p:
+        bot.send_message(message.chat.id, "⚠️ প্রোডাক্ট খুঁজে পাওয়া যায়নি। Admin Panel থেকে আবার চেষ্টা করুন।")
+        user_state[uid] = {"menu": "admin_panel"}
+        return
+
+    file_name = message.document.file_name or ""
+    if not file_name.lower().endswith((".txt", ".csv", ".xlsx")):
+        bot.send_message(message.chat.id, "⚠️ শুধুমাত্র .txt, .csv বা .xlsx ফাইল সাপোর্ট করে। আবার পাঠান।")
+        return
+
+    # ফাইল ডাউনলোড ও parse করা হচ্ছে - এখনো stock এ যুক্ত হয়নি, শুধু preview/confirmation এর জন্য
+    try:
+        file_info = bot.get_file(message.document.file_id)
+        downloaded = bot.download_file(file_info.file_path)
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ ফাইল ডাউনলোড করতে সমস্যা হয়েছে: {e}")
+        return
+
+    parsed_items = []
+    try:
+        if file_name.lower().endswith(".xlsx"):
+            parsed_items = parse_stock_from_xlsx(downloaded)
+        else:
+            text = downloaded.decode("utf-8", errors="ignore")
+            for raw_line in text.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if "|" in line:
+                    number, otp_link = line.split("|", 1)
+                elif "," in line:
+                    number, otp_link = line.split(",", 1)
+                else:
+                    number, otp_link = line, "N/A"
+                number = number.strip()
+                otp_link = otp_link.strip() or "N/A"
+                if number:
+                    parsed_items.append({"number": number, "otp_link": otp_link})
+    except ImportError:
+        bot.send_message(
+            message.chat.id,
+            "❌ .xlsx ফাইল পড়ার জন্য সার্ভারে openpyxl লাইব্রেরি ইনস্টল নেই।\n"
+            "ইনস্টল করুন: pip install openpyxl",
+        )
+        return
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ ফাইল পার্স করতে সমস্যা হয়েছে: {e}")
+        return
+
+    if not parsed_items:
+        bot.send_message(message.chat.id, "⚠️ ফাইলে কোনো valid লাইন পাওয়া যায়নি। ফরম্যাট চেক করে আবার পাঠান।")
+        return
+
+    # confirm করার আগে price জিজ্ঞেস করা হচ্ছে; pending_items এখনো stock_list এ যুক্ত হয়নি
+    user_state[uid] = {
+        "menu": "admin_upload_price_wait",
+        "product": product_key,
+        "pending_items": parsed_items,
+        "pending_file_name": file_name,
+    }
+    bot.send_message(
+        message.chat.id,
+        f"💰 এই {len(parsed_items)} পিস <b>{p['name']}</b> এর প্রতি ইউনিট price (USDT) লিখে পাঠান।\n\n"
+        "উদাহরণ: 0.125",
+    )
+    bot.register_next_step_handler(message, process_stock_price_input)
+
+
+def process_stock_price_input(message):
+    """Admin এর দেওয়া per-unit USDT price validate করে, তারপর Confirm Stock Upload দেখায়।"""
+    uid = message.from_user.id
+    if not is_admin(uid):
+        return
+
+    text = (message.text or "").strip()
+    if text in ["⬅️ Back", "⬅️ Back to Menu"]:
+        go_back(message)
+        return
+
+    state = user_state.get(uid, {})
+    if state.get("menu") != "admin_upload_price_wait":
+        bot.send_message(message.chat.id, "⚠️ কোনো pending upload নেই। আগে একটা ফাইল পাঠান।")
+        return
+
+    try:
+        price_usdt = float(text)
+    except ValueError:
+        price_usdt = None
+
+    if price_usdt is None or price_usdt <= 0:
+        bot.send_message(message.chat.id, "⚠️ সঠিক একটি price সংখ্যায় লিখুন (যেমন: 0.125)।")
+        bot.register_next_step_handler(message, process_stock_price_input)
+        return
+
+    if price_usdt == int(price_usdt):
+        price_usdt = int(price_usdt)
+
+    product_key = state.get("product")
+    parsed_items = state.get("pending_items", [])
+    file_name = state.get("pending_file_name", "")
+    p = products.get(product_key)
+
+    if not p or not parsed_items:
+        bot.send_message(message.chat.id, "⚠️ Pending ডেটা খুঁজে পাওয়া যায়নি। আবার আপলোড করুন।")
+        user_state[uid] = {"menu": "admin_panel"}
+        return
+
+    user_state[uid] = {
+        "menu": "admin_upload_confirm",
+        "product": product_key,
+        "pending_items": parsed_items,
+        "pending_price_usdt": price_usdt,
+    }
+
+    preview = "\n".join(f"• {it['number']} | {it['otp_link']}" for it in parsed_items[:3])
+    if len(parsed_items) > 3:
+        preview += f"\n...আরও {len(parsed_items) - 3} টি"
+
+    current_stock = len(p.setdefault("stock_list", []))
+    bot.send_message(
+        message.chat.id,
+        "🔎 <b>Confirm Stock Upload</b>\n\n"
+        f"📦 প্রোডাক্ট: {p['name']}\n"
+        f"📄 ফাইল: {file_name}\n"
+        f"🔢 ফাইলে পাওয়া গেছে: {len(parsed_items)} পিস\n"
+        f"💰 Price: {price_usdt} USDT (প্রতি পিস)\n\n"
+        f"প্রিভিউ:\n{preview}\n\n"
+        f"📊 বর্তমান স্টক: {current_stock} → Confirm করলে হবে: {current_stock + len(parsed_items)}\n\n"
+        "এই এন্ট্রিগুলো stock এ যুক্ত করতে চান?",
+        reply_markup=upload_confirm_inline(),
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data in ("stockup_confirm", "stockup_cancel") and is_admin(c.from_user.id)
+)
+def cb_admin_upload_confirm(call):
+    uid = call.from_user.id
+    chat_id = call.message.chat.id
+    state = user_state.get(uid, {})
+    bot.answer_callback_query(call.id)
+
+    if state.get("menu") != "admin_upload_confirm":
+        bot.send_message(chat_id, "⚠️ কোনো pending upload নেই। আগে একটা ফাইল পাঠান।")
+        return
+
+    if call.data == "stockup_cancel":
+        bot.send_message(
+            chat_id,
+            "❌ Upload বাতিল করা হয়েছে। কিছুই stock এ যুক্ত হয়নি।",
+            reply_markup=admin_panel_inline(),
+        )
+        user_state[uid] = {"menu": "admin_panel"}
+        return
+
+    # stockup_confirm
+    product_key = state.get("product")
+    pending_items = state.get("pending_items", [])
+    price_usdt = state.get("pending_price_usdt", 0)
+    p = products.get(product_key)
+
+    if not p or not pending_items:
+        bot.send_message(chat_id, "⚠️ Pending ডেটা খুঁজে পাওয়া যায়নি। আবার আপলোড করুন।")
+        user_state[uid] = {"menu": "admin_panel"}
+        return
+
+    stock_list = p.setdefault("stock_list", [])
+    stock_list.extend(pending_items)
+    p["stock"] = len(stock_list)   # TODO: database তে persist করুন (এখনো in-memory)
+
+    stock_added_text = (
+        "🔔 <b>New Stock Added!</b>\n\n"
+        f"📱 Product: {p['name']}\n"
+        f"📦 Added: {len(pending_items)} numbers\n"
+        f"💰 Price: {price_usdt} USDT\n"
+        f"📊 Total {p['name']} Stock: {p['stock']}"
+    )
+    bot.send_message(chat_id, stock_added_text)
+    bot.send_message(
+        chat_id,
+        "📢 এই স্টক আপডেট সব ইউজারকে broadcast করতে চান?",
+        reply_markup=stock_broadcast_confirm_inline(),
+    )
+    user_state[uid] = {"menu": "admin_panel", "pending_broadcast_text": stock_added_text}
+
+
+# ---------------------------------------------------------------------------
+# ADMIN: Price পরিবর্তন (Set Price)
+# ---------------------------------------------------------------------------
+@bot.callback_query_handler(
+    func=lambda c: c.data in ("stockbroadcast_yes", "stockbroadcast_no") and is_admin(c.from_user.id)
+)
+def cb_stock_broadcast(call):
+    uid = call.from_user.id
+    chat_id = call.message.chat.id
+    bot.answer_callback_query(call.id)
+    state = user_state.get(uid, {})
+    text = state.get("pending_broadcast_text")
+
+    if call.data == "stockbroadcast_no" or not text:
+        bot.send_message(chat_id, "❌ Broadcast করা হয়নি।", reply_markup=admin_panel_inline())
+        user_state[uid] = {"menu": "admin_panel"}
+        return
+
+    sent, failed = broadcast_to_all_users(text)
+    bot.send_message(
+        chat_id,
+        "✅ <b>Broadcast সম্পন্ন!</b>\n\n"
+        f"👥 পাঠানো হয়েছে: {sent} জনকে\n"
+        f"❌ ব্যর্থ: {failed} জন",
+        reply_markup=admin_panel_inline(),
+    )
+    user_state[uid] = {"menu": "admin_panel"}
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("priceprod_") and is_admin(c.from_user.id))
+def cb_admin_price_product_select(call):
+    product_key = call.data.replace("priceprod_", "")
+    p = products.get(product_key)
+    if not p:
+        bot.answer_callback_query(call.id, "Product not found.")
+        return
+
+    user_state[call.from_user.id] = {"menu": "admin_set_price", "product": product_key}
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        call.message.chat.id,
+        f"💰 <b>{p['name']}</b> এর জন্য নতুন price লিখে পাঠান।\n"
+        f"বর্তমান price: {fmt_amount(p['price'])}\n\n"
+        "উদাহরণ: 50 অথবা 49.99",
+    )
+    bot.register_next_step_handler(call.message, process_set_price)
+
+
+def process_set_price(message):
+    """Admin এর দেওয়া নতুন price validate করে products dict এ সেট করে।"""
+    uid = message.from_user.id
+    if not is_admin(uid):
+        return
+
+    text = (message.text or "").strip()
+
+    # ইউজার মাঝপথে Back/Menu এ চলে যেতে চাইলে next-step এর সাথে conflict এড়ানো হচ্ছে
+    if text in ["⬅️ Back", "⬅️ Back to Menu"]:
+        go_back(message)
+        return
+
+    state = user_state.get(uid, {})
+    product_key = state.get("product")
+    p = products.get(product_key)
+    if not p:
+        bot.send_message(message.chat.id, "⚠️ প্রোডাক্ট খুঁজে পাওয়া যায়নি। Admin Panel থেকে আবার চেষ্টা করুন।")
+        user_state[uid] = {"menu": "admin_panel"}
+        return
+
+    try:
+        new_price = float(text)
+    except ValueError:
+        new_price = None
+
+    if new_price is None or new_price <= 0:
+        bot.send_message(message.chat.id, "⚠️ সঠিক একটি price সংখ্যায় লিখুন (যেমন: 50 অথবা 49.99)।")
+        bot.register_next_step_handler(message, process_set_price)
+        return
+
+    if new_price == int(new_price):
+        new_price = int(new_price)
+
+    old_price = p["price"]
+    p["price"] = new_price   # TODO: database তে persist করুন (এখনো in-memory)
+
+    bot.send_message(
+        message.chat.id,
+        "✅ <b>Price আপডেট হয়েছে!</b>\n\n"
+        f"📦 প্রোডাক্ট: {p['name']}\n"
+        f"💵 পুরাতন Price: {fmt_amount(old_price)}\n"
+        f"💵 নতুন Price: {fmt_amount(p['price'])}",
+        reply_markup=admin_panel_inline(),
+    )
+    user_state[uid] = {"menu": "admin_panel"}
+
+
+# ---------------------------------------------------------------------------
+# ADMIN: Dollar Rate সেট করা (fmt_amount সব জায়গায় এই রেট ব্যবহার করে)
+# ---------------------------------------------------------------------------
+def process_set_usd_rate(message):
+    """Admin এর দেওয়া নতুন USD->BDT রেট validate করে bot_settings এ সেট করে।"""
+    uid = message.from_user.id
+    if not is_admin(uid):
+        return
+
+    text = (message.text or "").strip()
+
+    if text in ["⬅️ Back", "⬅️ Back to Menu"]:
+        go_back(message)
+        return
+
+    try:
+        new_rate = float(text)
+    except ValueError:
+        new_rate = None
+
+    if new_rate is None or new_rate <= 0:
+        bot.send_message(message.chat.id, "⚠️ সঠিক একটি রেট সংখ্যায় লিখুন (যেমন: 122 অথবা 121.50)।")
+        bot.register_next_step_handler(message, process_set_usd_rate)
+        return
+
+    if new_rate == int(new_rate):
+        new_rate = int(new_rate)
+
+    old_rate = bot_settings.get("usd_rate") or 0
+    bot_settings["usd_rate"] = new_rate   # TODO: database তে persist করুন (এখনো in-memory)
+
+    bot.send_message(
+        message.chat.id,
+        "✅ <b>Dollar Rate আপডেট হয়েছে!</b>\n\n"
+        f"💱 পুরাতন রেট: {(f'1 USD = {old_rate} BDT') if old_rate else 'সেট করা নেই'}\n"
+        f"💱 নতুন রেট: 1 USD = {new_rate} BDT",
+        reply_markup=admin_panel_inline(),
+    )
+    user_state[uid] = {"menu": "admin_panel"}
+
+
+# ---------------------------------------------------------------------------
+# ADMIN: DB Export / Import (Backup ও Restore) — এখনো in-memory ডেটা, তাই
+# bot restart হলে সব হারিয়ে যায়; এই ফিচার দিয়ে ম্যানুয়ালি Export/Import করা
+# যাবে (TODO: ভবিষ্যতে persistent DB এলে auto-load এর দরকার থাকবে না)।
+# ---------------------------------------------------------------------------
+def _build_db_export_payload():
+    return {
+        "version": 1,
+        "exported_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "users": users,
+        "products": products,
+        "orders": orders,
+        "deposits": deposits,
+        "sms_log": sms_log,
+        "bot_settings": bot_settings,
+        "next_deposit_id": _deposit_id_counter[0],
+        "next_sms_id": _sms_id_counter[0],
+    }
+
+
+def _restore_db_from_payload(payload):
+    """ব্যাকআপ payload থেকে in-memory সব ডেটা রিপ্লেস করে। users/deposits এর
+    key (user_id/deposit_id) JSON এ string হয়ে যায়, তাই আবার int এ কনভার্ট
+    করা হচ্ছে।"""
+    new_users = {int(k): v for k, v in (payload.get("users") or {}).items()}
+    new_deposits = {int(k): v for k, v in (payload.get("deposits") or {}).items()}
+    new_orders = dict(payload.get("orders") or {})
+    new_products = payload.get("products")
+    new_sms_log = list(payload.get("sms_log") or [])
+    new_settings = payload.get("bot_settings")
+
+    users.clear()
+    users.update(new_users)
+
+    orders.clear()
+    orders.update(new_orders)
+
+    deposits.clear()
+    deposits.update(new_deposits)
+
+    sms_log.clear()
+    sms_log.extend(new_sms_log)
+
+    if isinstance(new_products, dict):
+        products.clear()
+        products.update(new_products)
+
+    if isinstance(new_settings, dict):
+        bot_settings.update(new_settings)
+        bot_settings.setdefault("deposit_methods", ["bKash", "Nagad", "Rocket", "Binance"])
+        bot_settings.setdefault("deposit_numbers", {})
+
+    if "next_deposit_id" in payload:
+        try:
+            _deposit_id_counter[0] = int(payload["next_deposit_id"])
+        except (TypeError, ValueError):
+            pass
+    if "next_sms_id" in payload:
+        try:
+            _sms_id_counter[0] = int(payload["next_sms_id"])
+        except (TypeError, ValueError):
+            pass
+
+
+def handle_db_import_file(message):
+    """Admin এর পাঠানো .json ব্যাকআপ ফাইল ডাউনলোড/পার্স করে, Restore করার আগে
+    কাউন্টসহ Confirm/Cancel বাটন দেখায় — সরাসরি ডেটা রিপ্লেস করে না।"""
+    uid = message.from_user.id
+    file_name = message.document.file_name or ""
+    if not file_name.lower().endswith(".json"):
+        bot.send_message(message.chat.id, "⚠️ শুধুমাত্র .json ব্যাকআপ ফাইল সাপোর্ট করে। আবার পাঠান।")
+        return
+
+    try:
+        file_info = bot.get_file(message.document.file_id)
+        downloaded = bot.download_file(file_info.file_path)
+        payload = json.loads(downloaded.decode("utf-8"))
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ ফাইল পড়তে/পার্স করতে সমস্যা হয়েছে: {e}")
+        return
+
+    if not isinstance(payload, dict) or "users" not in payload:
+        bot.send_message(message.chat.id, "⚠️ এটা এই বটের সঠিক ব্যাকআপ ফাইল বলে মনে হচ্ছে না।")
+        return
+
+    user_state[uid] = {"menu": "admin_import_db_confirm", "pending_import": payload}
+
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("✅ Confirm & Restore", callback_data="dbimport_confirm"),
+        types.InlineKeyboardButton("❌ Cancel", callback_data="dbimport_cancel"),
+    )
+    bot.send_message(
+        message.chat.id,
+        "🔎 <b>Confirm DB Import</b>\n\n"
+        f"📄 ফাইল: {file_name}\n"
+        f"👥 Users: {len(payload.get('users') or {})}\n"
+        f"🧾 Orders: {len(payload.get('orders') or {})}\n"
+        f"💰 Deposits: {len(payload.get('deposits') or {})}\n"
+        f"📩 SMS Log: {len(payload.get('sms_log') or [])}\n\n"
+        "⚠️ Confirm করলে বর্তমান সব ডেটা মুছে এই ব্যাকআপ দিয়ে রিপ্লেস হয়ে যাবে। এই কাজ Undo করা যাবে না।",
+        reply_markup=kb,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data in ("dbimport_confirm", "dbimport_cancel") and is_admin(c.from_user.id)
+)
+def cb_db_import_confirm(call):
+    uid = call.from_user.id
+    chat_id = call.message.chat.id
+    state = user_state.get(uid, {})
+    bot.answer_callback_query(call.id)
+
+    if state.get("menu") != "admin_import_db_confirm":
+        bot.send_message(chat_id, "⚠️ কোনো pending import নেই। আগে একটা ব্যাকআপ (.json) ফাইল পাঠান।")
+        return
+
+    if call.data == "dbimport_cancel":
+        bot.send_message(
+            chat_id,
+            "❌ Import বাতিল করা হয়েছে। কিছুই পরিবর্তন হয়নি।",
+            reply_markup=admin_panel_inline(),
+        )
+        user_state[uid] = {"menu": "admin_panel"}
+        return
+
+    payload = state.get("pending_import") or {}
+    try:
+        _restore_db_from_payload(payload)
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ Restore করতে সমস্যা হয়েছে: {e}")
+        user_state[uid] = {"menu": "admin_panel"}
+        return
+
+    bot.send_message(
+        chat_id,
+        "✅ <b>DB Import সম্পন্ন!</b>\n\n"
+        f"👥 Users: {len(users)}\n"
+        f"🧾 Orders: {len(orders)}\n"
+        f"💰 Deposits: {len(deposits)}\n"
+        f"📩 SMS Log: {len(sms_log)}",
+        reply_markup=admin_panel_inline(),
+    )
+    user_state[uid] = {"menu": "admin_panel"}
+
+
+# ---------------------------------------------------------------------------
+# FALLBACK
+# ---------------------------------------------------------------------------
+@bot.message_handler(func=lambda m: True, content_types=["text"])
+def fallback(message):
+    # TODO: register_next_step_handler গুলো active থাকলে সেগুলো এখানে conflict না করার
+    #       ব্যাপারে খেয়াল রাখবেন
+    bot.send_message(
+        message.chat.id,
+        "❓ বুঝতে পারিনি। নিচের মেনু থেকে বেছে নিন।",
+        reply_markup=main_menu_keyboard(message.from_user.id),
+    )
+
+
+# ---------------------------------------------------------------------------
+# SMS AUTO-DEPOSIT: পেমেন্ট SMS/নোটিফিকেশন পার্স করা ও pending deposit এর
+# সাথে ম্যাচ করা (bKash/Nagad/Rocket/Binance)
+# ---------------------------------------------------------------------------
+_SMS_INCOMING_HINTS = (
+    "you have received", "received tk", "received taka", "cash in",
+    "money received", "credited", "পেমেন্ট", "রিসিভ",
+)
+_SMS_OUTGOING_HINTS = (
+    "you have sent", "payment sent", "cash out", "withdrawn", "debited",
+    "you sent", "send money",
+)
+
+_AMOUNT_RE = re.compile(r"(?:tk|taka|bdt)\.?\s*([\d,]+(?:\.\d{1,2})?)", re.IGNORECASE)
+_TRXID_RE = re.compile(
+    r"(?:trx\s*id|txn\s*id|transaction\s*id|trxid|txnid|trx\s*no\.?|txn\s*no\.?|ref(?:erence)?\s*id)"
+    r"[\s:\-]*([a-z0-9]{4,})",
+    re.IGNORECASE,
+)
+# 🪙 Binance ওয়ালেট নোটিফিকেশনে TrxID থাকে না, বরং sender username থাকে (স্পেসসহ
+# হতে পারে) — উদাহরণ: "You have received a payment of 0.1 USDT from Garth
+# Mantifel wpgu on 2026-09-15 04:01:53(UTC)"
+_BINANCE_RECEIVED_RE = re.compile(
+    r"received\s+(?:a\s+)?payment\s+of\s*([\d]+(?:\.\d+)?)\s*([a-z]{2,10})\s+from\s+(.+?)\s+on\s+\d{4}-\d{1,2}-\d{1,2}",
+    re.IGNORECASE,
+)
+_SENDER_METHOD_CODES = {"16216": "Rocket"}   # Rocket এর অফিসিয়াল sender short-code
+_SENDER_METHOD_NAMES = {"nagad": "Nagad"}
+
+
+def _normalize_binance_name(name):
+    return re.sub(r"\s+", " ", name.strip())
+
+
+def _id_label(method):
+    return "Binance Username" if method == "Binance" else "TrxID"
+
+
+def _amount_unit(method):
+    return "USDT" if method == "Binance" else "BDT"
+
+
+def _method_from_sender(sender):
+    if not sender:
+        return ""
+    sender_l = sender.strip().lower()
+    for name, method in _SENDER_METHOD_NAMES.items():
+        if name in sender_l:
+            return method
+    s = re.sub(r"[^0-9]", "", sender)
+    for code, method in _SENDER_METHOD_CODES.items():
+        if s == code or s.endswith(code):
+            return method
+    return ""
+
+
+def parse_payment_sms(text, hint_method="", sender=""):
+    """একটা raw SMS টেক্সট থেকে method/amount/trx_id বের করার চেষ্টা করে।
+    ইনকামিং পেমেন্ট SMS না মনে হলে, বা amount/trx_id না পেলে None রিটার্ন করে।"""
+    if not text:
+        return None
+    t = text.strip()
+    tl = t.lower()
+
+    if any(h in tl for h in _SMS_OUTGOING_HINTS) and not any(h in tl for h in _SMS_INCOMING_HINTS):
+        return None  # টাকা পাঠানো/ক্যাশ-আউটের SMS, ডিপোজিটের জন্য না
+
+    bm = _BINANCE_RECEIVED_RE.search(t)
+    if bm:
+        try:
+            b_amount = float(bm.group(1))
+        except ValueError:
+            b_amount = None
+        b_name = _normalize_binance_name(bm.group(3))
+        if b_amount is not None and b_name:
+            return {"method": "Binance", "amount": b_amount, "trx_id": b_name}
+        return None
+
+    method = _method_from_sender(sender)
+    if not method:
+        if "bkash" in tl:
+            method = "bKash"
+        elif "nagad" in tl:
+            method = "Nagad"
+        elif "rocket" in tl or "dbbl" in tl:
+            method = "Rocket"
+        if not method and re.search(r"(?<!\d)16216(?!\d)", t):
+            method = "Rocket"
+    if not method and hint_method:
+        method = hint_method.strip()
+
+    amount = None
+    m = _AMOUNT_RE.search(t)
+    if m:
+        try:
+            amount = float(m.group(1).replace(",", ""))
+        except ValueError:
+            amount = None
+
+    trx_id = None
+    m2 = _TRXID_RE.search(t)
+    if m2:
+        trx_id = m2.group(1).strip().upper()
+
+    if amount is None or not trx_id:
+        return None
+    return {"method": method, "amount": amount, "trx_id": trx_id}
+
+
+def _methods_match(a, b):
+    """কোনোটা খালি থাকলে মিল ধরা হয় না — method যাচাই না করে auto-approve করা যাবে না।"""
+    a = (a or "").strip().lower()
+    b = (b or "").strip().lower()
+    return bool(a) and bool(b) and a == b
+
+
+def _amounts_match(method, a, b):
+    if a is None or b is None:
+        return False
+    eps = 0.0005 if method == "Binance" else 0.01
+    return abs(a - b) < eps
+
+
+def _auto_approve_deposit_with_sms(dep, sms):
+    """dep + sms দুটোকেই approved/used হিসেবে মার্ক করে ব্যালেন্স যোগ করে। কল
+    করার আগে নিশ্চিত হতে হবে dep['status'] == 'pending' এবং sms['is_used'] == False।"""
+    if dep["status"] != "pending" or sms["is_used"]:
+        return False
+
+    dep["status"] = "approved"
+    sms["is_used"] = True
+    sms["used_by_deposit_id"] = dep["id"]
+
+    u = users.get(dep["user_id"])
+    if u is not None:
+        u["balance"] += dep["amount"]
+        u["today_deposit"] += dep["amount"]
+
+    try:
+        bot.send_message(
+            dep["user_id"],
+            "✅ <b>Deposit Auto-Approved!</b>\n\n"
+            f"🆔 Request: DEP-{dep['id']}\n"
+            f"💳 Method: {dep['method']}\n"
+            f"💰 +{fmt_amount(dep['amount'])} added\n"
+            + (f"💰 New Balance: {fmt_amount(u['balance'])}" if u else ""),
+        )
+    except Exception:
+        pass
+    for admin_id in ADMIN_IDS:
+        try:
+            bot.send_message(
+                admin_id,
+                "🤖 <b>Auto-Approved Deposit (SMS matched)</b>\n\n"
+                f"🆔 DEP-{dep['id']} | 👤 <code>{dep['user_id']}</code>\n"
+                f"💳 {dep['method']} | 💰 {fmt_amount(dep['amount'])}\n"
+                f"🔑 {_id_label(dep['method'])}: <code>{dep['trx_id']}</code>\n"
+                f"📩 Matched SMS #{sms['id']}",
+            )
+        except Exception:
+            pass
+    return True
+
+
+def _auto_reject_mismatched_deposit(dep, sms, method_ok, amount_ok):
+    """TrxID মিলেছে কিন্তু Method/Amount মিলেনি — ইউজার ভুল তথ্য দিয়েছে, তাই
+    pending না রেখে সাথে সাথে reject করে ইউজারকে জানানো হচ্ছে।"""
+    if dep["status"] != "pending":
+        return
+    dep["status"] = "rejected"
+
+    mismatch_lines = []
+    if not method_ok:
+        mismatch_lines.append(f"💳 Method মিলছে না — Deposit: {dep['method']} vs SMS: {sms['method'] or '—'}")
+    if not amount_ok:
+        mismatch_lines.append(
+            f"💰 Amount মিলছে না — Deposit: {dep['amount']} vs SMS: {sms['amount']} {_amount_unit(sms['method'])}"
+        )
+
+    try:
+        bot.send_message(
+            dep["user_id"],
+            "❌ <b>আপনার দেওয়া তথ্য সঠিক নয়!</b>\n\n"
+            f"🆔 Request: DEP-{dep['id']}\n\n"
+            "আপনার দেওয়া Amount/Method আসল পেমেন্টের সাথে মিলছে না। সঠিক তথ্য দিয়ে "
+            "আবার Deposit চেষ্টা করুন, অথবা Support এ যোগাযোগ করুন।",
+        )
+    except Exception:
+        pass
+    for admin_id in ADMIN_IDS:
+        try:
+            bot.send_message(
+                admin_id,
+                "🚫 <b>Deposit Auto-Rejected — Mismatch</b>\n\n"
+                f"🆔 DEP-{dep['id']} (user {dep['user_id']})\n"
+                f"🔑 {_id_label(sms['method'])}: <code>{sms['trx_id']}</code> (মিলেছে)\n\n"
+                + "\n".join(mismatch_lines),
+            )
+        except Exception:
+            pass
+
+
+def try_auto_approve_from_stored_sms(dep):
+    """একটা নতুন pending deposit তৈরি হওয়ার সাথে সাথেই, আগে থেকেই সেইভ করা কোনো
+    ব্যবহার-না-হওয়া SMS এর সাথে TrxID মিলছে কিনা চেক করে; method+amount ও
+    মিললে তবেই অটো-অ্যাপ্রুভ করে। রিটার্ন করে: "approved" | "rejected_mismatch" | "no_match" """
+    trx = (dep.get("trx_id") or "").strip().upper()
+    if not trx:
+        return "no_match"
+
+    sms = next((s for s in sms_log if not s["is_used"] and s["trx_id"].upper() == trx), None)
+    if not sms:
+        return "no_match"
+
+    amount_ok = _amounts_match(dep["method"], dep.get("amount"), sms["amount"])
+    method_ok = _methods_match(dep["method"], sms["method"])
+    if amount_ok and method_ok:
+        return "approved" if _auto_approve_deposit_with_sms(dep, sms) else "no_match"
+
+    _auto_reject_mismatched_deposit(dep, sms, method_ok, amount_ok)
+    return "rejected_mismatch"
+
+
+def store_sms_and_try_match(text, sender="", hint_method=""):
+    """ওয়েবহুক থেকে আসা SMS/নোটিফিকেশন পার্স + সেইভ করে, এবং কোনো pending
+    ডিপোজিটের সাথে (TrxID দিয়ে) ম্যাচ করলে সাথে সাথে অটো-অ্যাপ্রুভ করে দেয়।
+    ফরোয়ার্ডার অ্যাপ রিট্রাই করলে (একই SMS দুইবার আসলে) ডুপ্লিকেট এন্ট্রি বানায় না।"""
+    parsed = parse_payment_sms(text, hint_method=hint_method, sender=sender)
+    if not parsed:
+        return {"stored": False, "reason": "not_a_payment_sms"}
+
+    for s in sms_log:
+        if parsed["method"] == "Binance":
+            if s["raw_text"] == text[:1000]:
+                return {"stored": True, "sms_id": s["id"], "duplicate": True}
+        else:
+            if s["trx_id"] == parsed["trx_id"] and s["amount"] is not None and abs(s["amount"] - parsed["amount"]) < 0.01:
+                return {"stored": True, "sms_id": s["id"], "duplicate": True}
+
+    sms_id = _next_sms_id()
+    sms = {
+        "id": sms_id,
+        "method": parsed["method"],
+        "amount": parsed["amount"],
+        "trx_id": parsed["trx_id"],
+        "raw_text": text[:1000],
+        "sender": (sender or "")[:64],
+        "is_used": False,
+        "used_by_deposit_id": None,
+        "date": datetime.datetime.now().strftime("%d/%m/%Y %I:%M %p"),
+    }
+    sms_log.append(sms)
+
+    for admin_id in ADMIN_IDS:
+        try:
+            bot.send_message(
+                admin_id,
+                "📥 <b>New SMS Received</b>\n\n"
+                f"💳 Method: {sms['method'] or '—'}\n"
+                f"🔑 {_id_label(sms['method'])}: <code>{sms['trx_id']}</code>\n"
+                f"💰 Amount: {sms['amount']} {_amount_unit(sms['method'])}\n"
+                f"📅 Time: {sms['date']}\n\n"
+                f"⏳ User {_id_label(sms['method'])} + Amount সাবমিট করলে auto-approve হবে।",
+            )
+        except Exception:
+            pass
+
+    dep = next(
+        (
+            d for d in deposits.values()
+            if d["status"] == "pending"
+            and d.get("trx_id")
+            and d["trx_id"].strip().upper() == sms["trx_id"].upper()
+        ),
+        None,
+    )
+    matched_dep_id = None
+    if dep:
+        amount_ok = _amounts_match(sms["method"], dep.get("amount"), sms["amount"])
+        method_ok = _methods_match(dep.get("method"), sms["method"])
+        if amount_ok and method_ok:
+            if _auto_approve_deposit_with_sms(dep, sms):
+                matched_dep_id = dep["id"]
+        else:
+            _auto_reject_mismatched_deposit(dep, sms, method_ok, amount_ok)
+
+    return {"stored": True, "sms_id": sms_id, "matched_deposit_id": matched_dep_id}
+
+
+# ---------------------------------------------------------------------------
+# SMS AUTO-DEPOSIT WEBHOOK SERVER (SMS Forwarder App -> এই বট)
+# ---------------------------------------------------------------------------
+# ফোনে ইনস্টল করা SMS Forwarder App (যেমন "SMS Forwarder", "Sms2Telegram" ইত্যাদি)
+# থেকে bKash/Nagad/Rocket/Binance এর পেমেন্ট SMS এখানে ফরোয়ার্ড করা হবে। যেকেউ
+# রিকোয়েস্ট পাঠিয়ে ভুয়া ব্যালেন্স যোগ করার চেষ্টা করতে পারে, তাই একটা গোপন
+# TOKEN বাধ্যতামূলক — .env / Railway Variables এ SMS_WEBHOOK_TOKEN সেট করুন।
+SMS_WEBHOOK_TOKEN = os.environ.get("SMS_WEBHOOK_TOKEN", "").strip()
+SMS_WEBHOOK_PATH = os.environ.get("SMS_WEBHOOK_PATH", "/sms-webhook").strip() or "/sms-webhook"
+if not SMS_WEBHOOK_TOKEN:
+    SMS_WEBHOOK_TOKEN = uuid.uuid4().hex
+    print(
+        "⚠️  SMS_WEBHOOK_TOKEN সেট করা ছিল না — একটা টেম্পোরারি টোকেন তৈরি করা হয়েছে "
+        f"(বট রিস্টার্টে বদলে যাবে): {SMS_WEBHOOK_TOKEN}\n"
+        f"   স্থায়ী রাখতে .env / Railway Variables এ যোগ করুন: SMS_WEBHOOK_TOKEN={SMS_WEBHOOK_TOKEN}"
+    )
+
+try:
+    from flask import Flask, request as flask_request
+
+    flask_app = Flask(__name__)
+except ImportError:
+    flask_app = None
+    print("⚠️  Flask ইনস্টল করা নেই, তাই SMS auto-deposit webhook চালু হবে না। ইনস্টল করুন: pip install flask")
+
+_SMS_TEXT_FIELD_NAMES = ("text", "message", "body", "content", "sms", "msg", "text_message", "sms_body", "smsBody", "key")
+_SMS_SENDER_FIELD_NAMES = ("from", "sender", "number", "phone", "sms_from", "smsFrom", "originator")
+
+
+def _dig_field(d, names):
+    """dict এর মধ্যে (nested dict হলেও একটু খুঁজে) common field name গুলো চেক করে।"""
+    if not isinstance(d, dict):
+        return ""
+    for k in names:
+        v = d.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    for v in d.values():
+        if isinstance(v, dict):
+            found = _dig_field(v, names)
+            if found:
+                return found
+    return ""
+
+
+def _check_sms_token(req):
+    token = req.args.get("token") or req.headers.get("X-Webhook-Token") or ""
+    return token == SMS_WEBHOOK_TOKEN
+
+
+if flask_app is not None:
+
+    @flask_app.route(SMS_WEBHOOK_PATH, methods=["GET", "POST"])
+    def sms_webhook_handler():
+        if not _check_sms_token(flask_request):
+            return {"ok": False, "error": "invalid_token"}, 401
+
+        text = flask_request.args.get("text") or flask_request.args.get("message") or ""
+        sender = flask_request.args.get("from") or flask_request.args.get("sender") or ""
+        hint_method = flask_request.args.get("method") or ""
+
+        if flask_request.method == "POST":
+            try:
+                raw_body_str = flask_request.get_data(as_text=True) or ""
+            except Exception:
+                raw_body_str = ""
+
+            body = {}
+            if raw_body_str:
+                try:
+                    parsed_json = json.loads(raw_body_str)
+                    if isinstance(parsed_json, dict):
+                        body = parsed_json
+                except Exception:
+                    if "=" in raw_body_str and "&" in raw_body_str:
+                        try:
+                            from urllib.parse import parse_qs
+
+                            parsed_form = parse_qs(raw_body_str)
+                            body = {k: v[0] for k, v in parsed_form.items() if v}
+                        except Exception:
+                            body = {}
+
+            if body:
+                text = text or _dig_field(body, _SMS_TEXT_FIELD_NAMES)
+                sender = sender or _dig_field(body, _SMS_SENDER_FIELD_NAMES)
+                hint_method = hint_method or _dig_field(body, ("method", "app", "provider"))
+
+            if not text and raw_body_str and not raw_body_str.lstrip().startswith(("{", "[")):
+                text = raw_body_str
+
+        if not text:
+            # ✅ SMS Forwarder app যেন সবসময় HTTP 200 পায় (নাহলে app এটাকে Fail/Retry ধরে)
+            return {"ok": True, "note": "no_text_field"}, 200
+
+        try:
+            result = store_sms_and_try_match(text, sender=sender, hint_method=hint_method)
+        except Exception as e:
+            print(f"❌ sms_webhook_handler error: {e}")
+            return {"ok": True, "note": "internal_error_logged"}, 200
+
+        return {"ok": True, **result}, 200
+
+    @flask_app.route("/", methods=["GET"])
+    def _sms_webhook_health():
+        return {"ok": True, "service": "sms-webhook", "path": SMS_WEBHOOK_PATH}, 200
+
+
+def _print_sms_webhook_url():
+    if RAILWAY_URL:
+        full_url = f"{RAILWAY_URL}{SMS_WEBHOOK_PATH}?token={SMS_WEBHOOK_TOKEN}"
+    else:
+        full_url = f"http://<your-server-ip>:{PORT}{SMS_WEBHOOK_PATH}?token={SMS_WEBHOOK_TOKEN}"
+    print(
+        f"📩 SMS webhook ready → {full_url}\n"
+        "   ফরোয়ার্ডার অ্যাপে GET/POST params হিসেবে পাঠান: text (SMS বডি), from (sender, ঐচ্ছিক)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# RUN (Polling for local test / Webhook for Railway)
+# ---------------------------------------------------------------------------
+def run_polling():
+    print("Bot running in POLLING mode...")
+    if flask_app is not None:
+        # SMS webhook এর জন্য আলাদা থ্রেডে ছোট একটা Flask সার্ভার চালু হচ্ছে,
+        # যাতে polling মোডেও SMS Forwarder App থেকে অটো-ডিপোজিট কাজ করে।
+        threading.Thread(
+            target=lambda: flask_app.run(host="0.0.0.0", port=PORT, use_reloader=False),
+            daemon=True,
+        ).start()
+        _print_sms_webhook_url()
+    bot.remove_webhook()
+    bot.infinity_polling()
+
+
+def run_webhook():
+    if flask_app is None:
+        print("❌ Flask ইনস্টল করা নেই, তাই WEBHOOK mode চালু করা যাচ্ছে না। ইনস্টল করুন: pip install flask")
+        return
+
+    app = flask_app
+    webhook_path = f"/webhook/{BOT_TOKEN}"
+
+    @app.route(webhook_path, methods=["POST"])
+    def telegram_webhook():
+        json_str = flask_request.get_data().decode("utf-8")
+        update = telebot.types.Update.de_json(json_str)
+        bot.process_new_updates([update])
+        return "OK", 200
+
+    bot.remove_webhook()
+    bot.set_webhook(url=f"{RAILWAY_URL}{webhook_path}")
+    print(f"Bot running in WEBHOOK mode on port {PORT} -> {RAILWAY_URL}{webhook_path}")
+    _print_sms_webhook_url()
+    app.run(host="0.0.0.0", port=PORT)
+
+
+if __name__ == "__main__":
+    if RAILWAY_URL:
+        run_webhook()
+    else:
+        run_polling()
